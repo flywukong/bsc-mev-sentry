@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -118,33 +117,6 @@ func (s *MevSentry) SendBid(ctx context.Context, args BidArgsWrapper) (bidHash c
 type BidBlockArgsWrapper struct {
 	buildertypes.BidBlockArgs
 	ValidatorHostName string `json:"validatorHostName,omitempty"`
-
-	// decodeElapsed / payloadBytes are populated by UnmarshalJSON. The RPC
-	// framework pays the full ingress JSON-decode cost (header + every tx as
-	// hex + blob sidecars, ~256KB of hex per blob) BEFORE SendBidBlock is
-	// entered, so without this it is invisible to every existing log.
-	decodeElapsed time.Duration
-	payloadBytes  int
-}
-
-// UnmarshalJSON wraps the default decode so we can measure the ingress
-// JSON-decode cost. The body is already in memory here, so this times pure CPU
-// (hex decode of all txs + blob sidecars), not network.
-func (w *BidBlockArgsWrapper) UnmarshalJSON(input []byte) error {
-	start := time.Now()
-	type plain struct {
-		buildertypes.BidBlockArgs
-		ValidatorHostName string `json:"validatorHostName,omitempty"`
-	}
-	var p plain
-	if err := json.Unmarshal(input, &p); err != nil {
-		return err
-	}
-	w.BidBlockArgs = p.BidBlockArgs
-	w.ValidatorHostName = p.ValidatorHostName
-	w.decodeElapsed = time.Since(start)
-	w.payloadBytes = len(input)
-	return nil
 }
 
 // SendBidBlock receives a BidBlock from a builder and proxies it to the target
@@ -169,9 +141,7 @@ func (s *MevSentry) SendBidBlock(ctx context.Context, args BidBlockArgsWrapper) 
 		return
 	}
 	signingHash := args.BidBlock.Hash()
-	ecStart := time.Now()
 	builder, err := args.EcrecoverSender()
-	ecElapsed := time.Since(ecStart)
 	if err != nil {
 		log.Errorw("failed to parse bid block signature", "err", err)
 		err = buildertypes.NewInvalidBidError(fmt.Sprintf("invalid signature:%v", err))
@@ -189,23 +159,7 @@ func (s *MevSentry) SendBidBlock(ctx context.Context, args BidBlockArgsWrapper) 
 	}
 
 	log.Debugw("[BID BLOCK SENT]", "block", args.BidBlock.Header.Number, "builder", builder, "hash", signingHash.TerminalString())
-	// validator.SendBidBlock -> ethclient.CallContext re-marshals the entire
-	// BidBlockArgs (blobs -> hex again) to JSON before the HTTP send, so
-	// forwardUs bundles egress-encode + network + validator handler + resp.
-	fwdStart := time.Now()
-	bidHash, err = validator.SendBidBlock(ctx, args.BidBlockArgs, builder, signingHash)
-	fwdElapsed := time.Since(fwdStart)
-	log.Debugw("[BID BLOCK TIMING]",
-		"block", args.BidBlock.Header.Number,
-		"hash", signingHash.TerminalString(),
-		"txs", len(args.BidBlock.Transactions),
-		"sidecars", len(args.BidBlock.Sidecars),
-		"payloadKB", args.payloadBytes/1024,
-		"decodeUs", args.decodeElapsed.Microseconds(),
-		"ecrecoverUs", ecElapsed.Microseconds(),
-		"forwardUs", fwdElapsed.Microseconds(),
-		"totalUs", time.Since(start).Microseconds())
-	return bidHash, err
+	return validator.SendBidBlock(ctx, args.BidBlockArgs, builder, signingHash)
 }
 
 // GetBidBlockPermissionArgs wraps the bare builder address with a validator

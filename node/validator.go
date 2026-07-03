@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,53 +24,6 @@ import (
 	"github.com/bnb-chain/bsc-mev-sentry/log"
 	"github.com/bnb-chain/bsc-mev-sentry/metrics"
 )
-
-// rpcTrace captures the few HTTP transport-level timings that matter for
-// localizing where an RPC's wall-clock time is spent. DNS / dial / TLS are
-// omitted: the sentry talks to a fixed validator over plain HTTP, so those
-// stages are either 0 or already absorbed into gotConnUs on a cold connection.
-type rpcTrace struct {
-	start       time.Time
-	connReused  bool
-	wasIdle     bool
-	idleUs      int64
-	getConnUs   int64
-	gotConnUs   int64
-	wroteReqUs  int64
-	firstByteUs int64
-}
-
-func newRPCTrace() (*rpcTrace, *httptrace.ClientTrace) {
-	t := &rpcTrace{start: time.Now()}
-	elapsed := func() int64 { return time.Since(t.start).Microseconds() }
-	return t, &httptrace.ClientTrace{
-		// GetConn fires when the transport STARTS acquiring a connection, i.e.
-		// right after the request (incl. params marshal) has been built. So:
-		//   marshal cost   ≈ getConnUs
-		//   conn pool wait = gotConnUs - getConnUs (should be ~0 on a warm pool)
-		GetConn: func(_ string) { t.getConnUs = elapsed() },
-		GotConn: func(info httptrace.GotConnInfo) {
-			t.gotConnUs = elapsed()
-			t.connReused = info.Reused
-			t.wasIdle = info.WasIdle
-			t.idleUs = info.IdleTime.Microseconds()
-		},
-		WroteRequest:         func(_ httptrace.WroteRequestInfo) { t.wroteReqUs = elapsed() },
-		GotFirstResponseByte: func() { t.firstByteUs = elapsed() },
-	}
-}
-
-func (t *rpcTrace) logFields() []any {
-	return []any{
-		"connReused", t.connReused,
-		"wasIdle", t.wasIdle,
-		"idleUs", t.idleUs,
-		"getConnUs", t.getConnUs,
-		"gotConnUs", t.gotConnUs,
-		"wroteReqUs", t.wroteReqUs,
-		"firstByteUs", t.firstByteUs,
-	}
-}
 
 var (
 	PayBidTxGasUsed = uint64(25000)
@@ -185,22 +137,7 @@ func (n *validator) SendBid(ctx context.Context, args buildertypes.BidArgs, buil
 }
 
 func (n *validator) SendBidBlock(ctx context.Context, args buildertypes.BidBlockArgs, builder common.Address, bidHash common.Hash) (common.Hash, error) {
-	// Measure payload + HTTP transport stages to compare against SendBid.
-	txBytes := 0
-	for _, t := range args.BidBlock.Transactions {
-		txBytes += len(t)
-	}
-	sidecarCount := 0
-	for _, sc := range args.BidBlock.Sidecars {
-		sidecarCount += len(sc.Blobs)
-	}
-	trace, hooks := newRPCTrace()
-	tracedCtx := httptrace.WithClientTrace(ctx, hooks)
-
-	t0 := time.Now()
-	hash, err := n.client.SendBidBlock(tracedCtx, args)
-	rttUs := time.Since(t0).Microseconds()
-
+	hash, err := n.client.SendBidBlock(ctx, args)
 	if err != nil {
 		metrics.ChainError.Inc()
 		log.Errorw("failed to send bid block",
@@ -213,17 +150,7 @@ func (n *validator) SendBidBlock(ctx context.Context, args buildertypes.BidBlock
 			err = errors.New("timeout when send bid block to validator")
 		}
 	}
-	fields := []any{
-		"block", args.BidBlock.Header.Number,
-		"builder", builder,
-		"bidHash", bidHash.TerminalString(),
-		"txCount", len(args.BidBlock.Transactions),
-		"txBytes", txBytes,
-		"sidecarBlobs", sidecarCount,
-		"rttUs", rttUs,
-	}
-	fields = append(fields, trace.logFields()...)
-	log.Debugw("[BID BLOCK RESP]", fields...)
+	log.Debugw("[BID BLOCK RESP]", "block", args.BidBlock.Header.Number, "builder", builder, "bidHash", bidHash.TerminalString())
 
 	return hash, err
 }
