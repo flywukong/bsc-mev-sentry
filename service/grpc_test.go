@@ -404,8 +404,8 @@ func (b *blockingValidator) SendBidBlock(_ context.Context, _ buildertypes.BidBl
 	return bidHash, nil
 }
 
-// With the semaphore full: a queued request must abort when its context ends,
-// and health must keep answering (it bypasses the semaphore).
+// With the semaphore full: a further request is rejected immediately, and
+// health must keep answering (it bypasses the semaphore).
 func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
@@ -440,11 +440,11 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	}()
 	<-val.entered // semaphore held from here on
 
-	// Second call queues on the semaphore; its deadline must free it.
-	shortCtx, shortCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer shortCancel()
-	_, err = relay.SendBidBlock(shortCtx, req)
-	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	// Second call finds no slot and is rejected at once (no queueing).
+	rejectStart := time.Now()
+	_, err = relay.SendBidBlock(ctx, req)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Less(t, time.Since(rejectStart), 2*time.Second)
 
 	// Health bypasses the semaphore and answers while the slot is held.
 	hc := healthpb.NewHealthClient(conn)
@@ -548,4 +548,47 @@ func TestGRPCShutdownDrainsInFlightBid(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("shutdown did not finish after the in-flight bid completed")
 	}
+}
+
+// With no slot free the interceptor must reject immediately rather than queue:
+// waiting would park a decoded message and burn the bid deadline.
+func TestConcurrencyRejectsImmediatelyWhenFull(t *testing.T) {
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{} // slot held
+
+	ic := concurrencyInterceptor(nil, sem)
+	called := false
+	start := time.Now()
+	_, err := ic(context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
+		func(context.Context, any) (any, error) { called = true; return nil, nil })
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.False(t, called, "handler must not run without a slot")
+	require.Less(t, time.Since(start), 100*time.Millisecond, "must not queue")
+
+	// Health and other non-relay methods keep working with the slot held.
+	_, err = ic(context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: "/grpc.health.v1.Health/Check"},
+		func(context.Context, any) (any, error) { return nil, nil })
+	require.NoError(t, err)
+
+	// The gRPC-specific cap sheds on its own, even with the shared budget free.
+	grpcSem := make(chan struct{}, 1)
+	grpcSem <- struct{}{}
+	ic = concurrencyInterceptor(grpcSem, make(chan struct{}, 100))
+	_, err = ic(context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
+		func(context.Context, any) (any, error) { return nil, nil })
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+
+	// A rejected shared-budget acquisition must not leak the gRPC slot.
+	freeGRPC := make(chan struct{}, 1)
+	fullShared := make(chan struct{}, 1)
+	fullShared <- struct{}{}
+	ic = concurrencyInterceptor(freeGRPC, fullShared)
+	_, err = ic(context.Background(), nil,
+		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
+		func(context.Context, any) (any, error) { return nil, nil })
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Len(t, freeGRPC, 0, "gRPC slot must be released when the shared budget rejects")
 }

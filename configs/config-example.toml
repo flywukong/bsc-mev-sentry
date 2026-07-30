@@ -6,6 +6,7 @@ RootDir = "./logs" # Directory for log files. Set to "" to write to stderr only 
 HTTPListenAddr = "localhost:8555" # The address to listen on for HTTP requests.
 GRPCListenAddr = "" # BEP-675 BuilderRelay gRPC endpoint (e.g. "localhost:50051"). Empty = disabled.
 RPCConcurrency = 100 # The maximum number of concurrent requests.
+GRPCConcurrency = 16 # Concurrent BidBlock requests (also bounded by RPCConcurrency). A full-payload BidBlock peaks at several times its wire size, so size this from measured RSS under load; start near 8 on a ~2GiB pod. 0 = default 16.
 RPCTimeout = "10s" # The timeout for RPC requests.
 
 [[Validators]]

@@ -69,8 +69,7 @@ func main() {
 		panic(err)
 	}
 
-	// One semaphore across HTTP and gRPC so total in-flight requests respect a
-	// single RPCConcurrency budget (separate limits would allow 2x).
+	// Share one concurrency budget across HTTP and gRPC.
 	concurrencySem := ginutils.NewConcurrencySem(cfg.Service.RPCConcurrency)
 
 	var grpcService *service.GRPCService
@@ -97,10 +96,7 @@ func main() {
 		httpErrCh <- httpServer.ListenAndServe()
 	}()
 
-	// Block until a shutdown signal or an HTTP listener failure, then drain
-	// BOTH listeners: gRPC flips health to NOT_SERVING and drains streams,
-	// http.Server.Shutdown stops accepting and waits for in-flight JSON-RPC.
-	// A rolling restart therefore never kills a bid mid-forward on either path.
+	// Drain both listeners on a signal or HTTP failure.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -110,9 +106,7 @@ func main() {
 		log.Errorf("http server stopped, err:%v", err)
 	}
 
-	// Drain window for in-flight requests on shutdown. Covers the default
-	// RPCTimeout (10s) with margin while staying well inside the typical k8s
-	// termination grace period (30s).
+	// Covers the default 10s RPC timeout within a typical 30s pod grace period.
 	const drainTimeout = 15 * time.Second
 	var wg sync.WaitGroup
 	if grpcService != nil {

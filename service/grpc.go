@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	buildertypes "github.com/ethereum/go-ethereum/core/types/builder"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 
@@ -26,29 +27,19 @@ import (
 	mevpb "github.com/bnb-chain/bsc-mev-sentry/proto"
 )
 
-// maxGRPCMsgSize bounds inbound BidBlock payloads. A 6-blob BidBlock is ~1MB
-// of raw bytes; a future 16-blob block would be ~2.5MB. 8MB = protocol maximum
-// plus generous headroom, while capping how much a single request can make the
-// transport buffer. NOTE: this and MaxConcurrentStreams are the only limits
-// that act BEFORE protobuf decode — the interceptor semaphore runs after the
-// message is already in memory, so rate/connection limits at the LB/firewall
-// layer remain necessary for full ingress protection.
-const maxGRPCMsgSize = 8 * 1024 * 1024
+// maxGRPCMsgSize bounds one request while admitting every legal BidBlock:
+// the RLP body alone may reach params.MaxBlockSize (8MiB, Osaka+), and blob
+// sidecars ride on top of it. LB-level connection and rate limits are still
+// required.
+const maxGRPCMsgSize = 2 * params.MaxBlockSize
 
-// maxGRPCConcurrentStreams caps pre-interceptor request decoding per HTTP/2
-// connection. The business semaphore remains the process-wide limit; this
-// transport-level cap is defense in depth because interceptors run only after
-// protobuf has already materialized the request.
+// maxGRPCConcurrentStreams bounds pre-interceptor decoding per connection.
 const maxGRPCConcurrentStreams = 32
 
-// relayMethodPrefix scopes the concurrency limit to business RPCs; health and
-// reflection must never queue behind bid traffic or LB probes would time out
-// exactly when the process is overloaded, causing cascading removal.
+// relayMethodPrefix excludes health and reflection from business throttling.
 const relayMethodPrefix = "/mev.v1.BuilderRelay/"
 
-// grpcSendBidBlockMetric is the metric method label for SendBidBlock — shared
-// by the handler and the recovery interceptor so panics and ordinary errors
-// land under one label.
+// grpcSendBidBlockMetric keeps handler and interceptor metrics consistent.
 const grpcSendBidBlockMetric = "grpc_mev_sendBidBlock"
 
 // grpcMethodLabel maps a gRPC full method name to its metric label.
@@ -59,9 +50,7 @@ func grpcMethodLabel(fullMethod string) string {
 	return fullMethod
 }
 
-// BuilderRelayServer serves BEP-675 BidBlock traffic over gRPC. The RLP
-// payload keeps blobs as raw bytes on ingress, skipping the hex inflation and
-// JSON parse cost before the current JSON-RPC validator forwarding step.
+// BuilderRelayServer receives RLP-encoded BidBlocks over gRPC.
 type BuilderRelayServer struct {
 	mevpb.UnimplementedBuilderRelayServer
 	sentry *MevSentry
@@ -74,10 +63,7 @@ func (b *BuilderRelayServer) SendBidBlock(ctx context.Context, req *mevpb.BidBlo
 	start := time.Now()
 	defer recordLatency(method, start)
 	defer timeoutCancel(&ctx, b.sentry.timeout)()
-	// The body returns raw business errors; this defer counts each failure
-	// (keyed by the MEV business code when present, else the final gRPC code)
-	// BEFORE converting to a gRPC status — converting first would erase the
-	// business code from the metric.
+	// Count the original business code before converting it to gRPC status.
 	defer func() {
 		if err != nil {
 			orig := err
@@ -90,8 +76,7 @@ func (b *BuilderRelayServer) SendBidBlock(ctx context.Context, req *mevpb.BidBlo
 		}
 	}()
 
-	// Routing needs an explicit target: gRPC has no HTTP Host fallback.
-	// Validate before paying for the RLP decode.
+	// gRPC has no HTTP Host fallback, so routing must be explicit.
 	host := strings.TrimSpace(req.ValidatorHostName)
 	if host == "" {
 		return nil, buildertypes.NewInvalidBidError("validator_host_name is required")
@@ -129,9 +114,7 @@ func (b *BuilderRelayServer) SendBidBlock(ctx context.Context, req *mevpb.BidBlo
 	return &mevpb.BidBlockResponse{BidHash: bidHash.Bytes()}, nil
 }
 
-// toGRPCStatus maps sentry/validator errors onto gRPC codes so builders can
-// tell retryable congestion from permanent rejection. The original MEV
-// business code is preserved in status details (ErrorInfo).
+// toGRPCStatus maps MEV errors and preserves their code in ErrorInfo.
 func toGRPCStatus(err error) error {
 	if s, ok := status.FromError(err); ok && s.Code() != codes.Unknown {
 		return err // already a grpc status (e.g. from validation above)
@@ -145,8 +128,7 @@ func toGRPCStatus(err error) error {
 
 	var rpcErr rpc.Error
 	if !errors.As(err, &rpcErr) {
-		// Unknown internal failure: don't leak validator RPC text or internal
-		// details to the caller; the original error is already logged.
+		// Do not expose internal validator errors.
 		return status.Error(codes.Internal, "internal error")
 	}
 
@@ -166,11 +148,9 @@ func toGRPCStatus(err error) error {
 	case buildertypes.BidBlockTooLateError:
 		code = codes.DeadlineExceeded
 	default:
-		// rpc.Error with a code outside the MEV set: same non-disclosure rule.
 		return status.Error(codes.Internal, "internal error")
 	}
 
-	// Business rejections carry safe, actionable messages — keep them.
 	st := status.New(code, err.Error())
 	if detailed, derr := st.WithDetails(&errdetails.ErrorInfo{
 		Reason: strconv.Itoa(rpcErr.ErrorCode()),
@@ -181,9 +161,7 @@ func toGRPCStatus(err error) error {
 	return st.Err()
 }
 
-// errorCodeLabel picks the metric label for a failure: the MEV business code
-// from the ORIGINAL error when present (conversion to a gRPC status erases
-// it), else the final gRPC code string.
+// errorCodeLabel prefers the original MEV code for metrics.
 func errorCodeLabel(orig, final error) string {
 	var rpcErr rpc.Error
 	if errors.As(orig, &rpcErr) {
@@ -192,14 +170,8 @@ func errorCodeLabel(orig, final error) string {
 	return status.Code(final).String()
 }
 
-// recoveryInterceptor turns a handler panic into an Internal error instead of
-// crashing the process (grpc-go does not recover handler panics; one would
-// take down the JSON-RPC path sharing this process). Remote input flows into
-// RLP decoding and downstream logic, so this is the process-level defense
-// boundary — it recovers ordinary panics only, not OOM or fatal runtime
-// errors. Mirrors ginutils.PanicRecovery on the JSON path. It must sit
-// outermost in the interceptor chain. Only the stack is logged, never the
-// request payload.
+// recoveryInterceptor converts handler panics to Internal errors.
+// It must be the outermost interceptor and never logs request payloads.
 func recoveryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (resp any, err error) {
 	defer func() {
@@ -213,24 +185,43 @@ func recoveryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInf
 	return handler(ctx, req)
 }
 
-// concurrencyInterceptor bounds in-flight BuilderRelay requests with a
-// process-wide semaphore shared with the JSON path's gin ConcurrencyLimiter,
-// so the two listeners together respect one RPCConcurrency budget. Health and
-// other non-business RPCs bypass the semaphore. Acquisition waits in line
-// (matching the gin middleware) but aborts if the caller's context ends.
-// Per-connection MaxConcurrentStreams is NOT sufficient here: a client can
-// open more connections to bypass it.
-func concurrencyInterceptor(sem chan struct{}) grpc.UnaryServerInterceptor {
+// concurrencyInterceptor bounds BuilderRelay requests with two semaphores:
+// grpcSem caps the memory-heavy gRPC path on its own, and sharedSem is the
+// process-wide RPCConcurrency budget also held by the JSON path. Non-business
+// RPCs bypass both.
+//
+// It does NOT queue (unlike the gin middleware): a request that cannot take a
+// slot is rejected at once. Waiting would park a decoded message per waiter
+// with no bound on the number of waiters, and would spend the bid's deadline
+// before any work starts — a queued bid is usually past bidMustBefore anyway.
+// Failing fast keeps peak memory a function of the two caps alone and lets the
+// builder react in time.
+func concurrencyInterceptor(grpcSem, sharedSem chan struct{}) grpc.UnaryServerInterceptor {
+	reject := func(fullMethod string) error {
+		err := status.Error(codes.ResourceExhausted, "concurrency limit reached")
+		metrics.ApiErrorCounter.WithLabelValues(grpcMethodLabel(fullMethod), status.Code(err).String()).Inc()
+		return err
+	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler) (any, error) {
-		if sem != nil && strings.HasPrefix(info.FullMethod, relayMethodPrefix) {
+		if !strings.HasPrefix(info.FullMethod, relayMethodPrefix) {
+			return handler(ctx, req)
+		}
+		// Tighter gRPC-specific cap first, so overload sheds here.
+		if grpcSem != nil {
 			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-ctx.Done():
-				err := status.FromContextError(ctx.Err()).Err()
-				metrics.ApiErrorCounter.WithLabelValues(grpcMethodLabel(info.FullMethod), status.Code(err).String()).Inc()
-				return nil, err
+			case grpcSem <- struct{}{}:
+				defer func() { <-grpcSem }()
+			default:
+				return nil, reject(info.FullMethod)
+			}
+		}
+		if sharedSem != nil {
+			select {
+			case sharedSem <- struct{}{}:
+				defer func() { <-sharedSem }()
+			default:
+				return nil, reject(info.FullMethod)
 			}
 		}
 		return handler(ctx, req)
@@ -263,28 +254,33 @@ func (g *GRPCService) Shutdown(timeout time.Duration) {
 	}
 }
 
-// StartGRPCServer starts the BuilderRelay gRPC endpoint on addr. It runs
-// alongside the JSON-RPC listener; both feed the same MevSentry core. sem is
-// the shared concurrency semaphore (nil = unlimited) — pass the same channel
-// the gin middleware uses so total process concurrency stays bounded.
-func StartGRPCServer(addr string, sentry *MevSentry, sem chan struct{}) (*GRPCService, error) {
+// StartGRPCServer starts BuilderRelay beside JSON-RPC. sharedSem is the
+// process-wide RPCConcurrency semaphore (also used by the gin middleware);
+// the gRPC path additionally takes its own GRPCConcurrency slot.
+// sem is shared with Gin; nil disables process-wide throttling.
+func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*GRPCService, error) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("grpc listen on %s: %w", addr, err)
 	}
+
+	grpcConcurrency := sentry.grpcConcurrency
+	if grpcConcurrency <= 0 {
+		grpcConcurrency = defaultGRPCConcurrency
+	}
+	grpcSem := make(chan struct{}, grpcConcurrency)
 
 	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(maxGRPCMsgSize),
 		grpc.MaxSendMsgSize(maxGRPCMsgSize),
 		grpc.MaxConcurrentStreams(maxGRPCConcurrentStreams),
 		// recovery outermost so it also covers the other interceptors.
-		grpc.ChainUnaryInterceptor(recoveryInterceptor, concurrencyInterceptor(sem)),
+		grpc.ChainUnaryInterceptor(recoveryInterceptor, concurrencyInterceptor(grpcSem, sharedSem)),
 	}
 	srv := grpc.NewServer(opts...)
 	mevpb.RegisterBuilderRelayServer(srv, &BuilderRelayServer{sentry: sentry})
 
-	// health.NewServer already reports SERVING for the empty (overall) probe;
-	// register the named service too for probes configured with a service name.
+	// Also support probes configured with the service name.
 	hs := health.NewServer()
 	hs.SetServingStatus(mevpb.BuilderRelay_ServiceDesc.ServiceName, healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(srv, hs)
@@ -293,8 +289,7 @@ func StartGRPCServer(addr string, sentry *MevSentry, sem chan struct{}) (*GRPCSe
 	go func() {
 		log.Infow("grpc builder relay listening", "addr", g.addr)
 		if err := srv.Serve(lis); err != nil {
-			// Unexpected listener death: mark NOT_SERVING so probes fail fast;
-			// the JSON-RPC path keeps the process alive.
+			// Keep JSON-RPC alive but fail gRPC health checks.
 			hs.Shutdown()
 			log.Errorw("grpc server stopped", "err", err)
 		}

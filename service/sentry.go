@@ -29,12 +29,25 @@ type Config struct {
 	GRPCListenAddr string
 	// RPCConcurrency limits simultaneous requests
 	RPCConcurrency int64
+	// GRPCConcurrency limits simultaneous BuilderRelay requests on top of
+	// RPCConcurrency. A BidBlock request peaks at several times its wire size
+	// (protobuf message + decoded object graph + hex JSON egress), so the gRPC
+	// path needs a much tighter cap than the shared budget. 0 falls back to
+	// defaultGRPCConcurrency; size it from measured RSS under max-payload load,
+	// not from the raw message limit (start near 8 on a ~2GiB pod).
+	GRPCConcurrency int64
 	// RPCTimeout rpc request timeout
 	RPCTimeout Duration
 }
 
+// defaultGRPCConcurrency caps in-flight BidBlock requests when the config
+// leaves GRPCConcurrency unset.
+const defaultGRPCConcurrency = 16
+
 type MevSentry struct {
 	timeout Duration
+	// grpcConcurrency caps in-flight BuilderRelay requests; 0 = default.
+	grpcConcurrency int64
 
 	validators map[string]node.Validator       // hostname -> validator
 	builders   map[common.Address]node.Builder // address -> builder
@@ -45,9 +58,10 @@ func NewMevSentry(cfg *Config,
 	builders map[common.Address]node.Builder,
 ) *MevSentry {
 	s := &MevSentry{
-		timeout:    cfg.RPCTimeout,
-		validators: validators,
-		builders:   builders,
+		timeout:         cfg.RPCTimeout,
+		grpcConcurrency: cfg.GRPCConcurrency,
+		validators:      validators,
+		builders:        builders,
 	}
 
 	return s
