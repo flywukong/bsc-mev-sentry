@@ -47,8 +47,7 @@ func sampleBidBlock() *buildertypes.BidBlock {
 	}
 }
 
-// The gRPC path RLP-encodes on the builder and decodes on the sentry; the
-// signing hash must survive the roundtrip or every signature breaks.
+// The signing hash must survive an RLP roundtrip.
 func TestBidBlockRLPRoundtripHash(t *testing.T) {
 	original := sampleBidBlock()
 
@@ -65,8 +64,7 @@ func TestBidBlockRLPRoundtripHash(t *testing.T) {
 	}
 }
 
-// blobSidecar builds a sidecar with n blobs. Content is deterministic per
-// index so roundtrip equality is meaningful (not all-zero).
+// blobSidecar returns deterministic test data.
 func blobSidecar(n int) *types.BlobSidecar {
 	sc := &types.BlobSidecar{
 		BlockNumber: big.NewInt(10779180),
@@ -87,8 +85,7 @@ func blobSidecar(n int) *types.BlobSidecar {
 	return sc
 }
 
-// Blobs are the whole point of the optimization, so the sidecar RLP roundtrip
-// and the JSON re-marshal (egress to validator) must both hold.
+// Blob sidecars must survive both transport encodings.
 func TestBidBlockSidecarRLPRoundtrip(t *testing.T) {
 	original := sampleBidBlock()
 	original.Sidecars = types.BlobSidecars{blobSidecar(4), blobSidecar(2)}
@@ -109,13 +106,11 @@ func TestBidBlockSidecarRLPRoundtrip(t *testing.T) {
 		require.Equal(t, original.Sidecars[i].Proofs, decoded.Sidecars[i].Proofs)
 	}
 
-	// Step 1 forwards to the validator over JSON-RPC, so the RLP-decoded block
-	// must still JSON-marshal cleanly for the egress path.
+	// The decoded block must remain valid JSON-RPC output.
 	_, err = json.Marshal(buildertypes.BidBlockArgs{BidBlock: &decoded})
 	require.NoError(t, err)
 
-	// A signature over the blob-carrying block must recover identically after
-	// the roundtrip.
+	// The signature must recover after the roundtrip.
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	sig, err := crypto.Sign(original.Hash().Bytes(), key)
@@ -125,8 +120,7 @@ func TestBidBlockSidecarRLPRoundtrip(t *testing.T) {
 	require.Equal(t, crypto.PubkeyToAddress(key.PublicKey), recovered)
 }
 
-// A builder signature made before RLP encoding must recover to the same
-// address after the sentry decodes the payload.
+// A signature must recover to the same builder after RLP.
 func TestBidBlockSignatureSurvivesRLP(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
@@ -147,8 +141,7 @@ func TestBidBlockSignatureSurvivesRLP(t *testing.T) {
 	require.Equal(t, builder, recovered)
 }
 
-// mockValidator captures the BidBlockArgs the sentry forwards, standing in for
-// the real JSON-RPC egress.
+// mockValidator captures forwarded BidBlock arguments.
 type mockValidator struct {
 	gotArgs    buildertypes.BidBlockArgs
 	gotBuilder common.Address
@@ -180,8 +173,7 @@ func (m *mockValidator) GeneratePayBidTx(context.Context, buildertypes.BidArgs, 
 	return nil, nil
 }
 
-// Both ingress paths must deliver equivalent BidBlockArgs to the validator:
-// same signing hash, same builder, same tx bytes, same sidecars, same signature.
+// Both ingress paths must deliver equivalent BidBlock arguments.
 func TestGRPCIngressMatchesJSONPath(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
@@ -198,7 +190,7 @@ func TestGRPCIngressMatchesJSONPath(t *testing.T) {
 			map[common.Address]node.Builder{builderAddr: nil})
 	}
 
-	// JSON path: args arrive as the already-decoded wrapper.
+	// JSON uses an already-decoded wrapper.
 	jsonVal := &mockValidator{}
 	_, err = newSentry(jsonVal).SendBidBlock(context.Background(), BidBlockArgsWrapper{
 		BidBlockArgs:      buildertypes.BidBlockArgs{BidBlock: block, Signature: sig},
@@ -206,7 +198,7 @@ func TestGRPCIngressMatchesJSONPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// gRPC path: args arrive as RLP bytes through the BuilderRelay handler.
+	// gRPC uses RLP bytes.
 	grpcVal := &mockValidator{}
 	encoded, err := rlp.EncodeToBytes(block)
 	require.NoError(t, err)
@@ -227,7 +219,7 @@ func TestGRPCIngressMatchesJSONPath(t *testing.T) {
 	require.Equal(t, jsonVal.gotArgs.BidBlock.Header.Hash(), grpcVal.gotArgs.BidBlock.Header.Hash())
 }
 
-// toGRPCStatus must give builders distinguishable codes per MEV error class.
+// MEV error classes must remain distinguishable.
 func TestToGRPCStatusMapping(t *testing.T) {
 	cases := []struct {
 		err  error
@@ -258,8 +250,7 @@ func TestToGRPCStatusMapping(t *testing.T) {
 	require.Equal(t, strconv.Itoa(buildertypes.BidBlockTooLateError), info.Reason)
 }
 
-// Handler-level rejections before/after decode must come back as
-// InvalidArgument, not Internal.
+// Input errors must return InvalidArgument.
 func TestGRPCHandlerErrorPaths(t *testing.T) {
 	sentry := NewMevSentry(&Config{RPCTimeout: Duration(0)},
 		map[string]node.Validator{}, map[common.Address]node.Builder{})
@@ -292,8 +283,7 @@ func TestGRPCHandlerErrorPaths(t *testing.T) {
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
-// End-to-end over a real listener: health probes answer, the full interceptor
-// chain runs, and graceful shutdown flips health to NOT_SERVING.
+// Exercise health, interceptors, and shutdown on a real listener.
 func TestStartGRPCServerEndToEnd(t *testing.T) {
 	sentry := NewMevSentry(&Config{RPCTimeout: Duration(0)},
 		map[string]node.Validator{}, map[common.Address]node.Builder{})
@@ -307,7 +297,7 @@ func TestStartGRPCServerEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// health: overall and named service both SERVING
+	// Check overall and named health.
 	hc := healthpb.NewHealthClient(conn)
 	for _, svcName := range []string{"", "mev.v1.BuilderRelay"} {
 		resp, herr := hc.Check(ctx, &healthpb.HealthCheckRequest{Service: svcName})
@@ -315,16 +305,14 @@ func TestStartGRPCServerEndToEnd(t *testing.T) {
 		require.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.Status)
 	}
 
-	// business call through the real chain (recovery + concurrency interceptors)
+	// Exercise the interceptor chain.
 	relay := mevpb.NewBuilderRelayClient(conn)
 	_, err = relay.SendBidBlock(ctx, &mevpb.BidBlockRequest{
 		BidBlockRlp: []byte{0xff}, Signature: []byte{0x01}, ValidatorHostName: "val-1",
 	})
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 
-	// Shutdown must flip health to NOT_SERVING BEFORE the server stops (so LBs
-	// drain first). Watch observes the transition; a plain post-stop error
-	// could not distinguish NOT_SERVING from the server just being gone.
+	// Observe NOT_SERVING before the connection closes.
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
 	w, err := hc.Watch(watchCtx, &healthpb.HealthCheckRequest{Service: ""})
@@ -345,14 +333,14 @@ func TestStartGRPCServerEndToEnd(t *testing.T) {
 	<-shutdownDone
 }
 
-// panicValidator triggers a handler panic once the request reaches forwarding.
+// panicValidator panics during forwarding.
 type panicValidator struct{ mockValidator }
 
 func (p *panicValidator) SendBidBlock(context.Context, buildertypes.BidBlockArgs, common.Address, common.Hash) (common.Hash, error) {
 	panic("boom")
 }
 
-// A handler panic must surface as Internal while the server keeps serving.
+// A panic must return Internal without stopping the server.
 func TestGRPCRecoveryKeepsServing(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
@@ -381,8 +369,7 @@ func TestGRPCRecoveryKeepsServing(t *testing.T) {
 	_, err = relay.SendBidBlock(ctx, req)
 	require.Equal(t, codes.Internal, status.Code(err))
 
-	// process/server survived the panic: health answers, and a second call
-	// still reaches the handler (panics again → Internal, not a dead conn).
+	// Health and later calls must still work.
 	hc := healthpb.NewHealthClient(conn)
 	resp, err := hc.Check(ctx, &healthpb.HealthCheckRequest{})
 	require.NoError(t, err)
@@ -391,7 +378,7 @@ func TestGRPCRecoveryKeepsServing(t *testing.T) {
 	require.Equal(t, codes.Internal, status.Code(err))
 }
 
-// blockingValidator holds every forward until release is closed.
+// blockingValidator waits for release before returning.
 type blockingValidator struct {
 	mockValidator
 	entered chan struct{}
@@ -404,8 +391,7 @@ func (b *blockingValidator) SendBidBlock(_ context.Context, _ buildertypes.BidBl
 	return bidHash, nil
 }
 
-// With the semaphore full: a further request is rejected immediately, and
-// health must keep answering (it bypasses the semaphore).
+// A full limit rejects bids but does not block health.
 func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
@@ -432,7 +418,7 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	relay := mevpb.NewBuilderRelayClient(conn)
 	req := &mevpb.BidBlockRequest{BidBlockRlp: encoded, Signature: sig, ValidatorHostName: "val-1"}
 
-	// First call occupies the single semaphore slot and blocks in the validator.
+	// Hold the only slot.
 	firstDone := make(chan error, 1)
 	go func() {
 		_, callErr := relay.SendBidBlock(ctx, req)
@@ -440,13 +426,13 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	}()
 	<-val.entered // semaphore held from here on
 
-	// Second call finds no slot and is rejected at once (no queueing).
+	// Reject the next call without queueing.
 	rejectStart := time.Now()
 	_, err = relay.SendBidBlock(ctx, req)
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.Less(t, time.Since(rejectStart), 2*time.Second)
 
-	// Health bypasses the semaphore and answers while the slot is held.
+	// Health bypasses the limit.
 	hc := healthpb.NewHealthClient(conn)
 	resp, err := hc.Check(ctx, &healthpb.HealthCheckRequest{})
 	require.NoError(t, err)
@@ -456,8 +442,7 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	require.NoError(t, <-firstDone)
 }
 
-// The error metric must keep the MEV business code; converting to a gRPC
-// status first would erase it (regression test for that exact bug).
+// Metrics must retain the original MEV error code.
 func TestErrorCodeLabelKeepsBusinessCode(t *testing.T) {
 	orig := buildertypes.ErrMevBusy
 	final := toGRPCStatus(orig)
@@ -550,13 +535,12 @@ func TestGRPCShutdownDrainsInFlightBid(t *testing.T) {
 	}
 }
 
-// With no slot free the interceptor must reject immediately rather than queue:
-// waiting would park a decoded message and burn the bid deadline.
-func TestConcurrencyRejectsImmediatelyWhenFull(t *testing.T) {
+// A full limit must reject without queueing.
+func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	sem := make(chan struct{}, 1)
 	sem <- struct{}{} // slot held
 
-	ic := concurrencyInterceptor(nil, sem)
+	ic := limitConcurrency(nil, sem)
 	called := false
 	start := time.Now()
 	_, err := ic(context.Background(), nil,
@@ -575,7 +559,7 @@ func TestConcurrencyRejectsImmediatelyWhenFull(t *testing.T) {
 	// The gRPC-specific cap sheds on its own, even with the shared budget free.
 	grpcSem := make(chan struct{}, 1)
 	grpcSem <- struct{}{}
-	ic = concurrencyInterceptor(grpcSem, make(chan struct{}, 100))
+	ic = limitConcurrency(grpcSem, make(chan struct{}, 100))
 	_, err = ic(context.Background(), nil,
 		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
 		func(context.Context, any) (any, error) { return nil, nil })
@@ -585,7 +569,7 @@ func TestConcurrencyRejectsImmediatelyWhenFull(t *testing.T) {
 	freeGRPC := make(chan struct{}, 1)
 	fullShared := make(chan struct{}, 1)
 	fullShared <- struct{}{}
-	ic = concurrencyInterceptor(freeGRPC, fullShared)
+	ic = limitConcurrency(freeGRPC, fullShared)
 	_, err = ic(context.Background(), nil,
 		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
 		func(context.Context, any) (any, error) { return nil, nil })

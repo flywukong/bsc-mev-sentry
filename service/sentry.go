@@ -24,29 +24,21 @@ import (
 type Config struct {
 	// HTTPListenAddr define the address sentry service listen on
 	HTTPListenAddr string
-	// GRPCListenAddr, when non-empty, enables the BuilderRelay gRPC endpoint
-	// (BEP-675 SendBidBlock over RLP). Empty (default) keeps it off.
+	// Empty disables the BuilderRelay gRPC endpoint.
 	GRPCListenAddr string
 	// RPCConcurrency limits simultaneous requests
 	RPCConcurrency int64
-	// GRPCConcurrency limits simultaneous BuilderRelay requests on top of
-	// RPCConcurrency. A BidBlock request peaks at several times its wire size
-	// (protobuf message + decoded object graph + hex JSON egress), so the gRPC
-	// path needs a much tighter cap than the shared budget. 0 falls back to
-	// defaultGRPCConcurrency; size it from measured RSS under max-payload load,
-	// not from the raw message limit (start near 8 on a ~2GiB pod).
+	// GRPCConcurrency limits in-flight gRPC BidBlocks. Zero uses the default.
 	GRPCConcurrency int64
 	// RPCTimeout rpc request timeout
 	RPCTimeout Duration
 }
 
-// defaultGRPCConcurrency caps in-flight BidBlock requests when the config
-// leaves GRPCConcurrency unset.
+// Default limit for in-flight gRPC BidBlocks.
 const defaultGRPCConcurrency = 16
 
 type MevSentry struct {
-	timeout Duration
-	// grpcConcurrency caps in-flight BuilderRelay requests; 0 = default.
+	timeout         Duration
 	grpcConcurrency int64
 
 	validators map[string]node.Validator       // hostname -> validator
@@ -129,16 +121,13 @@ func (s *MevSentry) SendBid(ctx context.Context, args BidArgsWrapper) (bidHash c
 	return validator.SendBid(ctx, args.BidArgs, builder)
 }
 
-// BidBlockArgsWrapper wraps BidBlockArgs with a validator routing hint,
-// mirroring BidArgsWrapper for the legacy SendBid path.
+// BidBlockArgsWrapper adds validator routing to BidBlockArgs.
 type BidBlockArgsWrapper struct {
 	buildertypes.BidBlockArgs
 	ValidatorHostName string `json:"validatorHostName,omitempty"`
 }
 
-// SendBidBlock receives a BidBlock from a builder and proxies it to the target
-// validator. Unlike SendBid, no PayBidTx is generated — the zero-simulate path
-// requires pure transparent forwarding.
+// SendBidBlock forwards a BidBlock without generating a PayBidTx.
 func (s *MevSentry) SendBidBlock(ctx context.Context, args BidBlockArgsWrapper) (bidHash common.Hash, err error) {
 	method := "mev_sendBidBlock"
 	start := time.Now()
@@ -155,8 +144,7 @@ func (s *MevSentry) SendBidBlock(ctx context.Context, args BidBlockArgsWrapper) 
 	return s.sendBidBlock(ctx, args)
 }
 
-// sendBidBlock is the transport-agnostic core of SendBidBlock, shared by the
-// JSON-RPC handler above and the gRPC BuilderRelay handler.
+// sendBidBlock is shared by JSON-RPC and gRPC.
 func (s *MevSentry) sendBidBlock(ctx context.Context, args BidBlockArgsWrapper) (bidHash common.Hash, err error) {
 	if args.BidBlock == nil || args.BidBlock.Header == nil {
 		log.Errorw("empty bid block or header")
@@ -185,9 +173,7 @@ func (s *MevSentry) sendBidBlock(ctx context.Context, args BidBlockArgsWrapper) 
 	return validator.SendBidBlock(ctx, args.BidBlockArgs, builder, signingHash)
 }
 
-// GetBidBlockPermissionArgs wraps the bare builder address with a validator
-// routing hint, mirroring BidArgsWrapper / BidBlockArgsWrapper for the
-// SendBid / SendBidBlock paths.
+// GetBidBlockPermissionArgs adds validator routing to a builder address.
 type GetBidBlockPermissionArgs struct {
 	Builder           common.Address `json:"builder"`
 	ValidatorHostName string         `json:"validatorHostName,omitempty"`
@@ -333,10 +319,7 @@ func recordLatency(method string, start time.Time) {
 	metrics.ApiLatencyHist.WithLabelValues(method).Observe(float64(time.Since(start).Milliseconds()))
 }
 
-// validatorFromRequest resolves the target validator for an RPC call.
-// validatorHostName, when non-empty, overrides the HTTP Host-based routing —
-// used by SendBid / SendBidBlock so a builder can pick the validator
-// explicitly via the wrapper's ValidatorHostName field. Other RPCs pass "".
+// validatorFromRequest resolves explicit or HTTP Host routing.
 func (s *MevSentry) validatorFromRequest(ctx context.Context, validatorHostName string) (node.Validator, error) {
 	hostname := rpc.PeerInfoFromContext(ctx).HTTP.Host
 	if strings.Contains(hostname, ":") {

@@ -27,23 +27,17 @@ import (
 	mevpb "github.com/bnb-chain/bsc-mev-sentry/proto"
 )
 
-// maxGRPCMsgSize bounds one request while admitting every legal BidBlock:
-// the RLP body alone may reach params.MaxBlockSize (8MiB, Osaka+), and blob
-// sidecars ride on top of it. LB-level connection and rate limits are still
-// required.
+// Allow a full block plus blob sidecars.
 const maxGRPCMsgSize = 2 * params.MaxBlockSize
 
-// maxGRPCConcurrentStreams bounds pre-interceptor decoding per connection.
+// Bound protobuf decoding per connection.
 const maxGRPCConcurrentStreams = 32
 
-// relayMethodPrefix excludes health and reflection from business throttling.
 const relayMethodPrefix = "/mev.v1.BuilderRelay/"
 
-// grpcSendBidBlockMetric keeps handler and interceptor metrics consistent.
 const grpcSendBidBlockMetric = "grpc_mev_sendBidBlock"
 
-// grpcMethodLabel maps a gRPC full method name to its metric label.
-func grpcMethodLabel(fullMethod string) string {
+func metricLabel(fullMethod string) string {
 	if fullMethod == mevpb.BuilderRelay_SendBidBlock_FullMethodName {
 		return grpcSendBidBlockMetric
 	}
@@ -56,8 +50,7 @@ type BuilderRelayServer struct {
 	sentry *MevSentry
 }
 
-// SendBidBlock decodes the RLP BidBlock and hands it to the same core logic
-// as the JSON-RPC handler (ecrecover, allowlist, routing, forwarding).
+// SendBidBlock decodes RLP and uses the JSON-RPC business path.
 func (b *BuilderRelayServer) SendBidBlock(ctx context.Context, req *mevpb.BidBlockRequest) (resp *mevpb.BidBlockResponse, err error) {
 	method := grpcSendBidBlockMetric
 	start := time.Now()
@@ -170,36 +163,26 @@ func errorCodeLabel(orig, final error) string {
 	return status.Code(final).String()
 }
 
-// recoveryInterceptor converts handler panics to Internal errors.
-// It must be the outermost interceptor and never logs request payloads.
-func recoveryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo,
+// recoverPanic converts handler panics to Internal errors.
+func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (resp any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Errorw("grpc handler panic", "method", info.FullMethod, "panic", r,
 				"stack", string(debug.Stack()))
-			metrics.ApiErrorCounter.WithLabelValues(grpcMethodLabel(info.FullMethod), "panic").Inc()
+			metrics.ApiErrorCounter.WithLabelValues(metricLabel(info.FullMethod), "panic").Inc()
 			err = status.Error(codes.Internal, "internal error")
 		}
 	}()
 	return handler(ctx, req)
 }
 
-// concurrencyInterceptor bounds BuilderRelay requests with two semaphores:
-// grpcSem caps the memory-heavy gRPC path on its own, and sharedSem is the
-// process-wide RPCConcurrency budget also held by the JSON path. Non-business
-// RPCs bypass both.
-//
-// It does NOT queue (unlike the gin middleware): a request that cannot take a
-// slot is rejected at once. Waiting would park a decoded message per waiter
-// with no bound on the number of waiters, and would spend the bid's deadline
-// before any work starts — a queued bid is usually past bidMustBefore anyway.
-// Failing fast keeps peak memory a function of the two caps alone and lets the
-// builder react in time.
-func concurrencyInterceptor(grpcSem, sharedSem chan struct{}) grpc.UnaryServerInterceptor {
+// limitConcurrency rejects relay calls when either limit is full.
+// It never queues; health calls bypass both limits.
+func limitConcurrency(grpcSem, sharedSem chan struct{}) grpc.UnaryServerInterceptor {
 	reject := func(fullMethod string) error {
 		err := status.Error(codes.ResourceExhausted, "concurrency limit reached")
-		metrics.ApiErrorCounter.WithLabelValues(grpcMethodLabel(fullMethod), status.Code(err).String()).Inc()
+		metrics.ApiErrorCounter.WithLabelValues(metricLabel(fullMethod), status.Code(err).String()).Inc()
 		return err
 	}
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo,
@@ -207,7 +190,7 @@ func concurrencyInterceptor(grpcSem, sharedSem chan struct{}) grpc.UnaryServerIn
 		if !strings.HasPrefix(info.FullMethod, relayMethodPrefix) {
 			return handler(ctx, req)
 		}
-		// Tighter gRPC-specific cap first, so overload sheds here.
+		// Apply the tighter gRPC limit first.
 		if grpcSem != nil {
 			select {
 			case grpcSem <- struct{}{}:
@@ -228,18 +211,17 @@ func concurrencyInterceptor(grpcSem, sharedSem chan struct{}) grpc.UnaryServerIn
 	}
 }
 
-// GRPCService owns the BuilderRelay server lifecycle.
+// GRPCService manages the BuilderRelay server.
 type GRPCService struct {
 	srv    *grpc.Server
 	health *health.Server
 	addr   string
 }
 
-// Addr returns the bound listen address (useful with ":0" in tests).
+// Addr returns the bound address.
 func (g *GRPCService) Addr() string { return g.addr }
 
-// Shutdown flips health to NOT_SERVING so LBs drain first, then waits up to
-// timeout for in-flight RPCs before forcing the server down.
+// Shutdown drains in-flight RPCs until timeout.
 func (g *GRPCService) Shutdown(timeout time.Duration) {
 	g.health.Shutdown()
 	done := make(chan struct{})
@@ -254,10 +236,8 @@ func (g *GRPCService) Shutdown(timeout time.Duration) {
 	}
 }
 
-// StartGRPCServer starts BuilderRelay beside JSON-RPC. sharedSem is the
-// process-wide RPCConcurrency semaphore (also used by the gin middleware);
-// the gRPC path additionally takes its own GRPCConcurrency slot.
-// sem is shared with Gin; nil disables process-wide throttling.
+// StartGRPCServer starts BuilderRelay beside JSON-RPC.
+// sharedSem is also used by the Gin middleware.
 func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*GRPCService, error) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -274,13 +254,12 @@ func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*
 		grpc.MaxRecvMsgSize(maxGRPCMsgSize),
 		grpc.MaxSendMsgSize(maxGRPCMsgSize),
 		grpc.MaxConcurrentStreams(maxGRPCConcurrentStreams),
-		// recovery outermost so it also covers the other interceptors.
-		grpc.ChainUnaryInterceptor(recoveryInterceptor, concurrencyInterceptor(grpcSem, sharedSem)),
+		grpc.ChainUnaryInterceptor(recoverPanic, limitConcurrency(grpcSem, sharedSem)),
 	}
 	srv := grpc.NewServer(opts...)
 	mevpb.RegisterBuilderRelayServer(srv, &BuilderRelayServer{sentry: sentry})
 
-	// Also support probes configured with the service name.
+	// Support named health probes.
 	hs := health.NewServer()
 	hs.SetServingStatus(mevpb.BuilderRelay_ServiceDesc.ServiceName, healthpb.HealthCheckResponse_SERVING)
 	healthpb.RegisterHealthServer(srv, hs)
@@ -289,7 +268,7 @@ func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*
 	go func() {
 		log.Infow("grpc builder relay listening", "addr", g.addr)
 		if err := srv.Serve(lis); err != nil {
-			// Keep JSON-RPC alive but fail gRPC health checks.
+			// Keep JSON-RPC alive and fail gRPC health checks.
 			hs.Shutdown()
 			log.Errorw("grpc server stopped", "err", err)
 		}
