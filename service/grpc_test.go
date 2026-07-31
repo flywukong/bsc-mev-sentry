@@ -543,11 +543,11 @@ func TestGRPCShutdownDrainsInFlightBid(t *testing.T) {
 }
 
 // A full limit must reject without queueing.
-func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
+func TestRelayAdmission(t *testing.T) {
 	sem := make(chan struct{}, 1)
 	sem <- struct{}{} // slot held
 
-	limit := limitConcurrency(nil, sem)
+	limit := admitRelay(nil, sem, 0)
 	start := time.Now()
 	_, err := limit(context.Background(), &tap.Info{
 		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
@@ -564,7 +564,7 @@ func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	// The gRPC-specific cap sheds on its own, even with the shared budget free.
 	grpcSem := make(chan struct{}, 1)
 	grpcSem <- struct{}{}
-	limit = limitConcurrency(grpcSem, make(chan struct{}, 100))
+	limit = admitRelay(grpcSem, make(chan struct{}, 100), 0)
 	_, err = limit(context.Background(), &tap.Info{
 		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
 	})
@@ -574,7 +574,7 @@ func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	freeGRPC := make(chan struct{}, 1)
 	fullShared := make(chan struct{}, 1)
 	fullShared <- struct{}{}
-	limit = limitConcurrency(freeGRPC, fullShared)
+	limit = admitRelay(freeGRPC, fullShared, 0)
 	_, err = limit(context.Background(), &tap.Info{
 		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
 	})
@@ -584,7 +584,7 @@ func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	// Accepted streams hold both slots until their stream context is closed.
 	freeShared := make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	limit = limitConcurrency(freeGRPC, freeShared)
+	limit = admitRelay(freeGRPC, freeShared, 0)
 	_, err = limit(ctx, &tap.Info{
 		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
 	})
@@ -595,4 +595,29 @@ func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return len(freeGRPC) == 0 && len(freeShared) == 0
 	}, time.Second, time.Millisecond)
+
+	// A server deadline releases slots even if the client sets no deadline.
+	timedGRPC := make(chan struct{}, 1)
+	timedShared := make(chan struct{}, 1)
+	limit = admitRelay(timedGRPC, timedShared, Duration(20*time.Millisecond))
+	timedCtx, err := limit(context.Background(), &tap.Info{
+		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
+	})
+	require.NoError(t, err)
+	select {
+	case <-timedCtx.Done():
+		require.ErrorIs(t, timedCtx.Err(), context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("server deadline did not cancel the stream")
+	}
+	require.Eventually(t, func() bool {
+		return len(timedGRPC) == 0 && len(timedShared) == 0
+	}, time.Second, time.Millisecond)
+
+	healthCtx, err := limit(context.Background(), &tap.Info{
+		FullMethodName: "/grpc.health.v1.Health/Check",
+	})
+	require.NoError(t, err)
+	_, hasDeadline := healthCtx.Deadline()
+	require.False(t, hasDeadline, "health must bypass the relay timeout")
 }

@@ -32,7 +32,7 @@ type Config struct {
 	// Each call holds protobuf, decoded RLP, and JSON egress data. Start near 8
 	// on a 2 GiB pod, then tune from max-payload RSS tests. Zero uses the default.
 	GRPCConcurrency int64
-	// RPCTimeout rpc request timeout
+	// RPCTimeout bounds an RPC; gRPC starts it before body upload.
 	RPCTimeout Duration
 }
 

@@ -180,10 +180,9 @@ func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	return handler(ctx, req)
 }
 
-// limitConcurrency applies both limits before protobuf decoding.
-// It rejects instead of waiting so payload memory stays bounded and bid deadlines
-// remain available to callers. Health calls bypass both limits.
-func limitConcurrency(grpcSem, sharedSem chan struct{}) tap.ServerInHandle {
+// admitRelay reserves both budgets before protobuf decoding.
+// The configured timeout covers body upload; health calls bypass admission.
+func admitRelay(grpcSem, sharedSem chan struct{}, timeout Duration) tap.ServerInHandle {
 	reject := func(fullMethod string) error {
 		err := status.Error(codes.ResourceExhausted, "concurrency limit reached")
 		metrics.ApiErrorCounter.WithLabelValues(metricLabel(fullMethod), status.Code(err).String()).Inc()
@@ -209,7 +208,12 @@ func limitConcurrency(grpcSem, sharedSem chan struct{}) tap.ServerInHandle {
 				return ctx, reject(info.FullMethodName)
 			}
 		}
+		cancel := func() {}
+		if timeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout))
+		}
 		context.AfterFunc(ctx, func() {
+			cancel()
 			returnSlot(sharedSem)
 			returnSlot(grpcSem)
 		})
@@ -266,7 +270,7 @@ func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*
 		grpc.MaxRecvMsgSize(maxGRPCMsgSize),
 		grpc.MaxSendMsgSize(maxGRPCMsgSize),
 		grpc.MaxConcurrentStreams(maxGRPCConcurrentStreams),
-		grpc.InTapHandle(limitConcurrency(grpcSem, sharedSem)),
+		grpc.InTapHandle(admitRelay(grpcSem, sharedSem, sentry.timeout)),
 		grpc.ChainUnaryInterceptor(recoverPanic),
 	}
 	srv := grpc.NewServer(opts...)
