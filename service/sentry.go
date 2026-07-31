@@ -28,7 +28,9 @@ type Config struct {
 	GRPCListenAddr string
 	// RPCConcurrency limits simultaneous requests
 	RPCConcurrency int64
-	// GRPCConcurrency limits in-flight gRPC BidBlocks. Zero uses the default.
+	// GRPCConcurrency caps gRPC BidBlocks in addition to RPCConcurrency.
+	// Each call holds protobuf, decoded RLP, and JSON egress data. Start near 8
+	// on a 2 GiB pod, then tune from max-payload RSS tests. Zero uses the default.
 	GRPCConcurrency int64
 	// RPCTimeout rpc request timeout
 	RPCTimeout Duration

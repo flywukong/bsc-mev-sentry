@@ -27,7 +27,8 @@ import (
 	mevpb "github.com/bnb-chain/bsc-mev-sentry/proto"
 )
 
-// Allow a full block plus blob sidecars.
+// Reserve one MaxBlockSize for the block and one for sidecars.
+// This is not a DoS boundary; LB connection and rate limits are still required.
 const maxGRPCMsgSize = 2 * params.MaxBlockSize
 
 // Bound protobuf decoding per connection.
@@ -163,7 +164,8 @@ func errorCodeLabel(orig, final error) string {
 	return status.Code(final).String()
 }
 
-// recoverPanic converts handler panics to Internal errors.
+// recoverPanic converts panics to Internal without logging payloads.
+// It must remain the outermost interceptor.
 func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler) (resp any, err error) {
 	defer func() {
@@ -177,8 +179,10 @@ func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	return handler(ctx, req)
 }
 
-// limitConcurrency rejects relay calls when either limit is full.
-// It never queues; health calls bypass both limits.
+// limitConcurrency applies the gRPC and process-wide limits without queueing.
+// Waiting retains one decoded payload per unbounded waiter and burns the deadline;
+// fail-fast keeps memory bounded and lets builders react while bids are valid.
+// Health calls bypass both limits.
 func limitConcurrency(grpcSem, sharedSem chan struct{}) grpc.UnaryServerInterceptor {
 	reject := func(fullMethod string) error {
 		err := status.Error(codes.ResourceExhausted, "concurrency limit reached")
@@ -221,7 +225,7 @@ type GRPCService struct {
 // Addr returns the bound address.
 func (g *GRPCService) Addr() string { return g.addr }
 
-// Shutdown drains in-flight RPCs until timeout.
+// Shutdown marks health unavailable before draining RPCs until timeout.
 func (g *GRPCService) Shutdown(timeout time.Duration) {
 	g.health.Shutdown()
 	done := make(chan struct{})
@@ -237,7 +241,7 @@ func (g *GRPCService) Shutdown(timeout time.Duration) {
 }
 
 // StartGRPCServer starts BuilderRelay beside JSON-RPC.
-// sharedSem is also used by the Gin middleware.
+// sharedSem is Gin's process-wide budget; gRPC also has its own tighter cap.
 func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*GRPCService, error) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
