@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/tap"
 
 	"github.com/bnb-chain/bsc-mev-sentry/node"
 	mevpb "github.com/bnb-chain/bsc-mev-sentry/proto"
@@ -391,8 +392,8 @@ func (b *blockingValidator) SendBidBlock(_ context.Context, _ buildertypes.BidBl
 	return bidHash, nil
 }
 
-// A full limit rejects bids but does not block health.
-func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
+// A full global limit rejects large bids across connections before decoding.
+func TestGRPCConcurrencyLimitAcrossConnections(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	builderAddr := crypto.PubkeyToAddress(key.PublicKey)
@@ -413,9 +414,13 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	conn, err := grpc.NewClient(svc.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	require.NoError(t, err)
 	defer conn.Close()
+	secondConn, err := grpc.NewClient(svc.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer secondConn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	relay := mevpb.NewBuilderRelayClient(conn)
+	secondRelay := mevpb.NewBuilderRelayClient(secondConn)
 	req := &mevpb.BidBlockRequest{BidBlockRlp: encoded, Signature: sig, ValidatorHostName: "val-1"}
 
 	// Hold the only slot.
@@ -426,14 +431,16 @@ func TestGRPCConcurrencyLimitAndHealthBypass(t *testing.T) {
 	}()
 	<-val.entered // semaphore held from here on
 
-	// Reject the next call without queueing.
+	// Reject a near-limit request on another connection without decoding or queueing.
 	rejectStart := time.Now()
-	_, err = relay.SendBidBlock(ctx, req)
+	_, err = secondRelay.SendBidBlock(ctx, &mevpb.BidBlockRequest{
+		BidBlockRlp: make([]byte, maxGRPCMsgSize-1024), ValidatorHostName: "val-1",
+	})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.Less(t, time.Since(rejectStart), 2*time.Second)
 
 	// Health bypasses the limit.
-	hc := healthpb.NewHealthClient(conn)
+	hc := healthpb.NewHealthClient(secondConn)
 	resp, err := hc.Check(ctx, &healthpb.HealthCheckRequest{})
 	require.NoError(t, err)
 	require.Equal(t, healthpb.HealthCheckResponse_SERVING, resp.Status)
@@ -540,39 +547,52 @@ func TestLimitConcurrencyRejectsWhenFull(t *testing.T) {
 	sem := make(chan struct{}, 1)
 	sem <- struct{}{} // slot held
 
-	ic := limitConcurrency(nil, sem)
-	called := false
+	limit := limitConcurrency(nil, sem)
 	start := time.Now()
-	_, err := ic(context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
-		func(context.Context, any) (any, error) { called = true; return nil, nil })
+	_, err := limit(context.Background(), &tap.Info{
+		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
+	})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
-	require.False(t, called, "handler must not run without a slot")
 	require.Less(t, time.Since(start), 100*time.Millisecond, "must not queue")
 
 	// Health and other non-relay methods keep working with the slot held.
-	_, err = ic(context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: "/grpc.health.v1.Health/Check"},
-		func(context.Context, any) (any, error) { return nil, nil })
+	_, err = limit(context.Background(), &tap.Info{
+		FullMethodName: "/grpc.health.v1.Health/Check",
+	})
 	require.NoError(t, err)
 
 	// The gRPC-specific cap sheds on its own, even with the shared budget free.
 	grpcSem := make(chan struct{}, 1)
 	grpcSem <- struct{}{}
-	ic = limitConcurrency(grpcSem, make(chan struct{}, 100))
-	_, err = ic(context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
-		func(context.Context, any) (any, error) { return nil, nil })
+	limit = limitConcurrency(grpcSem, make(chan struct{}, 100))
+	_, err = limit(context.Background(), &tap.Info{
+		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
+	})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 
 	// A rejected shared-budget acquisition must not leak the gRPC slot.
 	freeGRPC := make(chan struct{}, 1)
 	fullShared := make(chan struct{}, 1)
 	fullShared <- struct{}{}
-	ic = limitConcurrency(freeGRPC, fullShared)
-	_, err = ic(context.Background(), nil,
-		&grpc.UnaryServerInfo{FullMethod: mevpb.BuilderRelay_SendBidBlock_FullMethodName},
-		func(context.Context, any) (any, error) { return nil, nil })
+	limit = limitConcurrency(freeGRPC, fullShared)
+	_, err = limit(context.Background(), &tap.Info{
+		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
+	})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.Len(t, freeGRPC, 0, "gRPC slot must be released when the shared budget rejects")
+
+	// Accepted streams hold both slots until their stream context is closed.
+	freeShared := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	limit = limitConcurrency(freeGRPC, freeShared)
+	_, err = limit(ctx, &tap.Info{
+		FullMethodName: mevpb.BuilderRelay_SendBidBlock_FullMethodName,
+	})
+	require.NoError(t, err)
+	require.Len(t, freeGRPC, 1)
+	require.Len(t, freeShared, 1)
+	cancel()
+	require.Eventually(t, func() bool {
+		return len(freeGRPC) == 0 && len(freeShared) == 0
+	}, time.Second, time.Millisecond)
 }

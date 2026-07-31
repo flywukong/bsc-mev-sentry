@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/tap"
 
 	buildertypes "github.com/ethereum/go-ethereum/core/types/builder"
 	"github.com/ethereum/go-ethereum/params"
@@ -179,39 +180,46 @@ func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo,
 	return handler(ctx, req)
 }
 
-// limitConcurrency applies the gRPC and process-wide limits without queueing.
-// Waiting retains one decoded payload per unbounded waiter and burns the deadline;
-// fail-fast keeps memory bounded and lets builders react while bids are valid.
-// Health calls bypass both limits.
-func limitConcurrency(grpcSem, sharedSem chan struct{}) grpc.UnaryServerInterceptor {
+// limitConcurrency applies both limits before protobuf decoding.
+// It rejects instead of waiting so payload memory stays bounded and bid deadlines
+// remain available to callers. Health calls bypass both limits.
+func limitConcurrency(grpcSem, sharedSem chan struct{}) tap.ServerInHandle {
 	reject := func(fullMethod string) error {
 		err := status.Error(codes.ResourceExhausted, "concurrency limit reached")
 		metrics.ApiErrorCounter.WithLabelValues(metricLabel(fullMethod), status.Code(err).String()).Inc()
 		return err
 	}
-	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler) (any, error) {
-		if !strings.HasPrefix(info.FullMethod, relayMethodPrefix) {
-			return handler(ctx, req)
+	return func(ctx context.Context, info *tap.Info) (context.Context, error) {
+		if !strings.HasPrefix(info.FullMethodName, relayMethodPrefix) {
+			return ctx, nil
 		}
 		// Apply the tighter gRPC limit first.
 		if grpcSem != nil {
 			select {
 			case grpcSem <- struct{}{}:
-				defer func() { <-grpcSem }()
 			default:
-				return nil, reject(info.FullMethod)
+				return ctx, reject(info.FullMethodName)
 			}
 		}
 		if sharedSem != nil {
 			select {
 			case sharedSem <- struct{}{}:
-				defer func() { <-sharedSem }()
 			default:
-				return nil, reject(info.FullMethod)
+				returnSlot(grpcSem)
+				return ctx, reject(info.FullMethodName)
 			}
 		}
-		return handler(ctx, req)
+		context.AfterFunc(ctx, func() {
+			returnSlot(sharedSem)
+			returnSlot(grpcSem)
+		})
+		return ctx, nil
+	}
+}
+
+func returnSlot(sem chan struct{}) {
+	if sem != nil {
+		<-sem
 	}
 }
 
@@ -258,7 +266,8 @@ func StartGRPCServer(addr string, sentry *MevSentry, sharedSem chan struct{}) (*
 		grpc.MaxRecvMsgSize(maxGRPCMsgSize),
 		grpc.MaxSendMsgSize(maxGRPCMsgSize),
 		grpc.MaxConcurrentStreams(maxGRPCConcurrentStreams),
-		grpc.ChainUnaryInterceptor(recoverPanic, limitConcurrency(grpcSem, sharedSem)),
+		grpc.InTapHandle(limitConcurrency(grpcSem, sharedSem)),
+		grpc.ChainUnaryInterceptor(recoverPanic),
 	}
 	srv := grpc.NewServer(opts...)
 	mevpb.RegisterBuilderRelayServer(srv, &BuilderRelayServer{sentry: sentry})
