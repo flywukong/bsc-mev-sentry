@@ -35,25 +35,17 @@ type benchmarkBidBlockPayload struct {
 	block *buildertypes.BidBlock
 }
 
-// benchmarkBidBlockPayloads covers both ordinary control-plane overhead and
-// the blob-heavy case this transport was introduced for. The transaction
-// envelopes bring the six-blob RLP payload close to the measured 1.7 MB case.
-func benchmarkBidBlockPayloads(tb testing.TB) []benchmarkBidBlockPayload {
+const benchmarkTransactionGas = 25_096 // 21k base + 256 non-zero calldata bytes
+
+// addBenchmarkTransactions appends structurally valid, signed legacy
+// transaction envelopes. Set either count or targetBytes, leaving the other
+// zero. Nonces are unique within each fixture.
+func addBenchmarkTransactions(tb testing.TB, block *buildertypes.BidBlock, count, targetBytes int) {
 	tb.Helper()
+	if (count == 0) == (targetBytes == 0) {
+		tb.Fatal("set exactly one transaction target")
+	}
 
-	small := sampleBidBlock()
-	small.Header.Difficulty = big.NewInt(1)
-
-	blobHeavy := sampleBidBlock()
-	blobHeavy.Header.Difficulty = big.NewInt(1)
-	blobHeavy.Sidecars = append(blobHeavy.Sidecars, blobSidecar(6))
-	blobHeavy.Transactions = nil
-
-	// Fill roughly 900 KiB with structurally valid, signed legacy transaction
-	// envelopes. Nonces are unique, so both JSON and RLP decoding exercise a
-	// realistic object graph instead of one artificial byte slice. TxRoot,
-	// state execution and KZG validity remain out of scope for this sentry
-	// transport fixture.
 	keyBytes := make([]byte, 32)
 	keyBytes[len(keyBytes)-1] = 1
 	txKey, err := crypto.ToECDSA(keyBytes)
@@ -66,13 +58,17 @@ func benchmarkBidBlockPayloads(tb testing.TB) []benchmarkBidBlockPayload {
 	for i := range data {
 		data[i] = byte(i%251 + 1)
 	}
-	const (
-		targetTransactionBytes = 900 * 1024
-		transactionGas         = 25_096 // 21k base + 256 non-zero calldata bytes
-	)
+
+	block.Transactions = nil
 	var encodedBytes int
-	for nonce := uint64(0); encodedBytes < targetTransactionBytes; nonce++ {
-		tx := types.NewTransaction(nonce, to, big.NewInt(1), transactionGas, big.NewInt(1_000_000_000), data)
+	for nonce := uint64(0); ; nonce++ {
+		if count > 0 && len(block.Transactions) >= count {
+			break
+		}
+		if targetBytes > 0 && encodedBytes >= targetBytes {
+			break
+		}
+		tx := types.NewTransaction(nonce, to, big.NewInt(1), benchmarkTransactionGas, big.NewInt(1_000_000_000), data)
 		signed, err := types.SignTx(tx, signer, txKey)
 		if err != nil {
 			tb.Fatal(err)
@@ -81,13 +77,36 @@ func benchmarkBidBlockPayloads(tb testing.TB) []benchmarkBidBlockPayload {
 		if err != nil {
 			tb.Fatal(err)
 		}
-		blobHeavy.Transactions = append(blobHeavy.Transactions, encoded)
+		block.Transactions = append(block.Transactions, encoded)
 		encodedBytes += len(encoded)
 	}
-	blobHeavy.Header.GasUsed = uint64(len(blobHeavy.Transactions)) * transactionGas
+	block.Header.GasUsed = uint64(len(block.Transactions)) * benchmarkTransactionGas
+}
+
+func benchmarkBidBlock(tb testing.TB, txCount, blobCount int) *buildertypes.BidBlock {
+	tb.Helper()
+	block := sampleBidBlock()
+	block.Header.Difficulty = big.NewInt(1)
+	addBenchmarkTransactions(tb, block, txCount, 0)
+	if blobCount > 0 {
+		block.Sidecars = append(block.Sidecars, blobSidecar(blobCount))
+	}
+	return block
+}
+
+// benchmarkBidBlockPayloads covers ordinary and blob-heavy production shapes.
+// The final fixture remains close to the measured 1.7 MB RLP case.
+func benchmarkBidBlockPayloads(tb testing.TB) []benchmarkBidBlockPayload {
+	tb.Helper()
+
+	blobHeavy := sampleBidBlock()
+	blobHeavy.Header.Difficulty = big.NewInt(1)
+	blobHeavy.Sidecars = append(blobHeavy.Sidecars, blobSidecar(6))
+	addBenchmarkTransactions(tb, blobHeavy, 0, 900*1024)
 
 	return []benchmarkBidBlockPayload{
-		{name: "small", block: small},
+		{name: "200tx", block: benchmarkBidBlock(tb, 200, 0)},
+		{name: "150tx_3blob", block: benchmarkBidBlock(tb, 150, 3)},
 		{name: "6blob_1.7MB", block: blobHeavy},
 	}
 }
@@ -178,7 +197,13 @@ func (*benchmarkValidator) SendBidBlock(_ context.Context, _ buildertypes.BidBlo
 // decoding and both transport-native roundtrips before the mock forwarding
 // boundary. Synthetic blob proofs are intentionally not consensus-verified.
 func TestLargeBidBlockTransportFixture(t *testing.T) {
-	block := benchmarkBidBlockPayloads(t)[1].block
+	payloads := benchmarkBidBlockPayloads(t)
+	require.Len(t, payloads[0].block.Transactions, 200)
+	require.Empty(t, payloads[0].block.Sidecars)
+	require.Len(t, payloads[1].block.Transactions, 150)
+	require.Len(t, payloads[1].block.Sidecars, 1)
+	require.Len(t, payloads[1].block.Sidecars[0].Blobs, 3)
+	block := payloads[2].block
 
 	rlpPayload, err := rlp.EncodeToBytes(block)
 	require.NoError(t, err)
