@@ -182,6 +182,16 @@ func TestGRPCIngressMatchesJSONPath(t *testing.T) {
 	require.Equal(t, jsonVal.gotArgs.BidBlock.Header.Hash(), grpcVal.gotArgs.BidBlock.Header.Hash())
 }
 
+// wireError mimics the *rpc.jsonError the ethclient returns for validator errors
+// that carry no dedicated MEV code (JSON-RPC default -32000).
+type wireError struct {
+	code int
+	msg  string
+}
+
+func (e wireError) Error() string  { return e.msg }
+func (e wireError) ErrorCode() int { return e.code }
+
 // MEV error classes must remain distinguishable.
 func TestToGRPCStatusMapping(t *testing.T) {
 	cases := []struct {
@@ -198,6 +208,7 @@ func TestToGRPCStatusMapping(t *testing.T) {
 		{context.DeadlineExceeded, codes.DeadlineExceeded},
 		{context.Canceled, codes.Canceled},
 		{errors.New("plain"), codes.Internal},
+		{wireError{code: -32000, msg: "bid already exists"}, codes.Unknown},
 	}
 	for _, c := range cases {
 		st, ok := status.FromError(toGRPCStatus(c.err))
@@ -208,10 +219,22 @@ func TestToGRPCStatusMapping(t *testing.T) {
 		}
 	}
 
-	// MEV business code must survive in status details.
-	st, _ := status.FromError(toGRPCStatus(buildertypes.NewBidBlockTooLateError("x")))
+	// A validator error with a generic JSON-RPC code keeps its message and code,
+	// so builders can distinguish "bid already exists" from "too many bids".
+	quota := wireError{code: -32000, msg: "too many bids: exceeded limit of 3 bids per builder per block"}
+	st, _ := status.FromError(toGRPCStatus(quota))
+	require.Equal(t, codes.Unknown, st.Code())
+	require.Equal(t, quota.msg, st.Message())
 	require.NotEmpty(t, st.Details())
 	info, ok := st.Details()[0].(*errdetails.ErrorInfo)
+	require.True(t, ok)
+	require.Equal(t, "-32000", info.Reason)
+	require.Equal(t, "-32000", errorCodeLabel(quota, toGRPCStatus(quota)))
+
+	// MEV business code must survive in status details.
+	st, _ = status.FromError(toGRPCStatus(buildertypes.NewBidBlockTooLateError("x")))
+	require.NotEmpty(t, st.Details())
+	info, ok = st.Details()[0].(*errdetails.ErrorInfo)
 	require.True(t, ok)
 	require.Equal(t, strconv.Itoa(buildertypes.BidBlockTooLateError), info.Reason)
 	require.Equal(t, strconv.Itoa(buildertypes.BidBlockTooLateError),

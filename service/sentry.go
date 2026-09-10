@@ -118,8 +118,16 @@ func (s *MevSentry) SendBid(ctx context.Context, args BidArgsWrapper) (bidHash c
 	args.PayBidTx = payBidTx
 	args.PayBidTxGasUsed = node.PayBidTxGasUsed
 
-	log.Debugw("[BID SENT]", "block", args.RawBid.BlockNumber, "builder", builder, "hash", args.RawBid.Hash().TerminalString())
-	return validator.SendBid(ctx, args.BidArgs, builder)
+	bidHash, err = validator.SendBid(ctx, args.BidArgs, builder)
+	if err == nil {
+		log.Debugw("[BID SENT]",
+			"block", args.RawBid.BlockNumber,
+			"builder", builder,
+			"hash", args.RawBid.Hash().TerminalString(),
+			"txs", len(args.RawBid.Txs),
+			"handlerUs", time.Since(start).Microseconds())
+	}
+	return bidHash, err
 }
 
 // BidBlockArgsWrapper adds validator routing to BidBlockArgs.
@@ -142,7 +150,17 @@ func (s *MevSentry) SendBidBlock(ctx context.Context, args BidBlockArgsWrapper) 
 		}
 	}()
 
-	return s.sendBidBlock(ctx, args)
+	bidHash, err = s.sendBidBlock(ctx, args)
+	if err == nil {
+		log.Debugw("[BID BLOCK JSON]",
+			"block", args.BidBlock.Header.Number,
+			"hash", bidHash.TerminalString(),
+			"txs", len(args.BidBlock.Transactions),
+			"sidecars", len(args.BidBlock.Sidecars),
+			"txBytes", bidBlockTxBytes(args.BidBlock),
+			"handlerUs", time.Since(start).Microseconds())
+	}
+	return bidHash, err
 }
 
 // sendBidBlock is shared by JSON-RPC and gRPC.
@@ -317,7 +335,15 @@ func (s *MevSentry) ReportIssue(ctx context.Context, issue buildertypes.BidIssue
 }
 
 func recordLatency(method string, start time.Time) {
-	metrics.ApiLatencyHist.WithLabelValues(method).Observe(float64(time.Since(start).Milliseconds()))
+	metrics.ApiLatencyHist.WithLabelValues(method).Observe(float64(time.Since(start)) / float64(time.Millisecond))
+}
+
+func bidBlockTxBytes(bb *buildertypes.BidBlock) int {
+	n := 0
+	for _, tx := range bb.Transactions {
+		n += len(tx)
+	}
+	return n
 }
 
 // validatorFromRequest resolves explicit or HTTP Host routing.

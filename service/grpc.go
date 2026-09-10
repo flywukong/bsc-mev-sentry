@@ -120,9 +120,10 @@ func (b *BidBlockServer) SendBidBlock(ctx context.Context, req *mevpb.BidBlockRe
 		"hash", bidHash.TerminalString(),
 		"txs", len(bidBlock.Transactions),
 		"sidecars", len(bidBlock.Sidecars),
-		"payloadKB", len(req.BidBlockRlp)/1024,
-		"decodeMs", decodeElapsed.Milliseconds(),
-		"totalMs", time.Since(start).Milliseconds())
+		"txBytes", bidBlockTxBytes(&bidBlock),
+		"payloadBytes", len(req.BidBlockRlp),
+		"decodeUs", decodeElapsed.Microseconds(),
+		"handlerUs", time.Since(start).Microseconds())
 	return &mevpb.BidBlockResponse{BidHash: bidHash.Bytes()}, nil
 }
 
@@ -160,7 +161,10 @@ func toGRPCStatus(err error) error {
 	case buildertypes.BidBlockTooLateError:
 		code = codes.DeadlineExceeded
 	default:
-		return status.Error(codes.Internal, "internal error")
+		// Validator errors without a dedicated MEV code (e.g. "bid already exists",
+		// "too many bids") arrive as JSON-RPC -32000. Keep the message so builders
+		// can tell them apart, as they can on the JSON-RPC path.
+		code = codes.Unknown
 	}
 
 	st := status.New(code, err.Error())
