@@ -59,6 +59,6 @@ var (
 		Namespace: namespace,
 		Subsystem: "registry",
 		Name:      "last_success_timestamp_seconds",
-		Help:      "Unix time of the last non-empty registry read.",
+		Help:      "Unix time of the last registry read accepted for admission.",
 	})
 )

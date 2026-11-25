@@ -32,14 +32,14 @@ URL = "http://bsc-builder-2"
 
 # Optional: keep the allowlist in sync with the on-chain BuilderKeyRegistry.
 # Effective allowlist = registry set ∪ ExtraBuilders. Service ports open after the first
-# non-empty on-chain read. Empty or failed reads preserve the previous allowlist.
+# non-empty on-chain read. After startup, an empty list admits only ExtraBuilders. Failed reads preserve the allowlist.
 [Registry]
 Enabled = false
 ContractAddress = "0x0000000000000000000000000000000000000000" # BuilderKeyRegistry proxy on this network.
 # defaultMaxKeys() must be nonzero at the same finalized block; the implementation address is rejected.
 # Each poll tries Validators.PrivateURL in order, starting with the first validator.
 # All sources must be on the same chain. Each source attempt has a 10-second timeout.
-PollInterval = "10m" # While non-empty. Empty registry: 3s. Failed reads: 2s backoff up to 1m.
+PollInterval = "10m" # After startup. Empty registry at startup: 3s. Failed reads: 2s backoff up to 1m.
 
 # Always accepted in addition to the registry set (e.g. a validator's own builder).
 # [[Registry.ExtraBuilders]]

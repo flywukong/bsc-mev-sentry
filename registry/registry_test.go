@@ -304,7 +304,7 @@ func TestSyncer_ErrorKeepsPreviousSet(t *testing.T) {
 	require.Equal(t, "registry", state.Snapshot().Source)
 }
 
-func TestSyncer_WaitsForNonEmptyRegistryAndKeepsLastList(t *testing.T) {
+func TestSyncer_WaitsForNonEmptyRegistryThenAppliesEmptyList(t *testing.T) {
 	ctx := context.Background()
 	cfg := Config{ExtraBuilders: []node.BuilderConfig{{Address: a3, URL: "mine"}}}
 	reader := &fakeReader{snaps: []*Snapshot{
@@ -328,19 +328,15 @@ func TestSyncer_WaitsForNonEmptyRegistryAndKeepsLastList(t *testing.T) {
 	default:
 		t.Fatal("non-empty registry did not signal readiness")
 	}
-	previous, ok := set.Lookup(a1)
-	require.True(t, ok)
-	for i := 0; i < 2; i++ {
-		require.Equal(t, ResultEmpty, s.SyncOnce(ctx))
-		require.True(t, set.Allowed(a1))
-		require.True(t, set.Allowed(a3))
-		require.False(t, set.Allowed(a2))
-		current, ok := set.Lookup(a1)
-		require.True(t, ok)
-		require.Same(t, previous, current)
+	require.True(t, set.Allowed(a1))
+	for i, result := range []Result{ResultApplied, ResultUnchanged} {
+		require.Equal(t, result, s.SyncOnce(ctx))
+		require.Equal(t, map[common.Address]bool{a3: true}, addrs(set))
+		require.False(t, set.Allowed(a1))
 		st := state.Snapshot()
-		require.Equal(t, uint64(3), st.BlockNumber)
-		require.Equal(t, "empty_registry", st.LastError)
+		require.Equal(t, uint64(4+i), st.BlockNumber)
+		require.Equal(t, 1, st.BuilderCount)
+		require.Empty(t, st.LastError)
 	}
 
 	require.Equal(t, ResultApplied, s.SyncOnce(ctx))

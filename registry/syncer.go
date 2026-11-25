@@ -20,13 +20,13 @@ type Result string
 
 const (
 	ResultApplied   Result = "applied"   // registry changed; allowlist replaced
-	ResultUnchanged Result = "unchanged" // same non-empty fingerprint as last time
-	ResultEmpty     Result = "empty"     // empty snapshot ignored
+	ResultUnchanged Result = "unchanged" // same fingerprint as last time
+	ResultEmpty     Result = "empty"     // waiting for the first non-empty snapshot
 	ResultError     Result = "error"     // read failed; previous allowlist kept
 )
 
 // Syncer periodically reads the registry and pushes the merged allowlist to the
-// sentry. Only non-empty snapshots are applied.
+// sentry. After the first non-empty snapshot, every successful read is authoritative.
 type Syncer struct {
 	reader   Reader
 	interval time.Duration
@@ -76,7 +76,7 @@ func (s *Syncer) Run(ctx context.Context) {
 	}
 }
 
-// nextDelay backs off after failures, polls quickly after an empty read, and
+// nextDelay backs off after failures, polls quickly while waiting for the initial list, and
 // otherwise waits the configured interval.
 func (s *Syncer) nextDelay(r Result) time.Duration {
 	if r == ResultError {
@@ -104,7 +104,7 @@ func (s *Syncer) SyncOnce(ctx context.Context) Result {
 		return s.record(ResultError)
 	}
 
-	if len(snap.Builders) == 0 {
+	if s.last == nil && len(snap.Builders) == 0 {
 		log.Warnw("empty builder registry; waiting for a non-empty snapshot", "block", snap.BlockNumber, "contract", s.contract)
 		s.status.RecordError("empty_registry")
 		return s.record(ResultEmpty)

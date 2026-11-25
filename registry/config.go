@@ -14,7 +14,7 @@ import (
 
 const (
 	DefaultPollInterval = 10 * time.Minute
-	// EmptyPollInterval bounds the wait until a refilled registry is observed.
+	// EmptyPollInterval bounds the wait for the first non-empty snapshot at startup.
 	EmptyPollInterval = 3 * time.Second
 	// Failed reads, including the first one at startup, retry with exponential
 	// backoff between these bounds.
@@ -26,14 +26,14 @@ const (
 
 // Config is the [Registry] section of the sentry config file.
 //
-// Effective allowlist: last non-empty registry set ∪ ExtraBuilders. The static [[Builders]] list is not used.
+// Effective allowlist: latest registry set ∪ ExtraBuilders. The static [[Builders]] list is not used.
 type Config struct {
 	// Enabled turns on periodic synchronization. When false the static
 	// [[Builders]] list is used exactly as before.
 	Enabled bool
 	// ContractAddress is the BuilderKeyRegistry proxy address on this network.
 	ContractAddress common.Address
-	// PollInterval between reads of a non-empty registry. Zero uses
+	// PollInterval between successful reads after startup. Zero uses
 	// DefaultPollInterval. Reads are always taken at the finalized block, so a
 	// change is visible one poll after finality.
 	PollInterval service.Duration

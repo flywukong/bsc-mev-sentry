@@ -98,16 +98,16 @@ Behavior:
 - Effective allowlist = registry set ∪ `ExtraBuilders`.
 - Reads take `getBuilders()` at the finalized block, so an applied change is never rolled back by a
   reorg. If the set changed it is swapped in atomically; requests never see a half-updated allowlist.
-- Poll schedule: every `PollInterval` (default 10 minutes) while the registry is non-empty; every
-  3 seconds while it is empty; after a failed read, including the first one, retry from 2 seconds
+- Poll schedule: every `PollInterval` (default 10 minutes) after startup; every
+  3 seconds when waiting for the first non-empty list; after a failed read, including the first one, retry from 2 seconds
   with exponential backoff up to 1 minute. Neither shorter interval exceeds `PollInterval`.
 - If all sources fail, the current allowlist stays in place and a warning is logged.
   An address returning no data fails with `no_code_at_address`; an invalid or zero
   `defaultMaxKeys()` result fails with `not_a_registry`. Neither changes the current state
   or allows the service ports to open before a non-empty first read.
-- An empty read keeps the last non-empty allowlist and reporting URLs. At startup, even configured
-  `ExtraBuilders` must wait for a non-empty on-chain list. Each empty read increments the
-  `result="empty"` counter; snapshot metadata still describes the last non-empty read.
+- At startup, an empty on-chain list yields `result="empty"` and keeps service ports closed, even with
+  `ExtraBuilders`. After startup, a valid empty list removes all registry-derived keys and report URLs.
+  Only local `ExtraBuilders` remain eligible; with none configured, all bids are rejected.
 - `mev_hasBuilder` answers from the sentry allowlist rather than from the validator node.
 - A builder whose issue-reporting URL cannot be dialed is still allowlisted; the connection is retried
   on the next `mev_reportIssue`.
