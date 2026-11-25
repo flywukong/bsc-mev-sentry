@@ -35,9 +35,6 @@ type Config struct {
 	Enabled bool
 	// ContractAddress is the BuilderKeyRegistry proxy address on this network.
 	ContractAddress common.Address
-	// RPCURL optionally supplies the first node to try before Validators.PrivateURL
-	// in configuration order. All sources must be trusted nodes on the same chain.
-	RPCURL string
 	// PollInterval between reads of a non-empty registry. Zero uses
 	// DefaultPollInterval. Reads are always taken at the finalized block, so a
 	// change is visible one poll after finality.
@@ -57,24 +54,6 @@ func (c *Config) Validate() error {
 		return errors.New("registry: PollInterval must be positive")
 	}
 	return nil
-}
-
-// RPCURLs returns distinct, non-empty sources in priority order: the optional
-// explicit RPCURL, followed by each validator's PrivateURL.
-func (c *Config) RPCURLs(validators []node.ValidatorConfig) []string {
-	var urls []string
-	seen := make(map[string]bool)
-	add := func(url string) {
-		if url != "" && !seen[url] {
-			urls = append(urls, url)
-			seen[url] = true
-		}
-	}
-	add(c.RPCURL)
-	for _, validator := range validators {
-		add(validator.PrivateURL)
-	}
-	return urls
 }
 
 func (c *Config) pollInterval() time.Duration {

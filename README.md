@@ -75,7 +75,6 @@ BuilderKeyRegistry contract published by the Good Will Alliance
 Enabled = true
 ContractAddress = "0x..."            # registry proxy address on this network
 PollInterval = "10m"
-# RPCURL = "http://<trusted-node>:8545"  # optional: try this node before the validators
 
 [[Registry.ExtraBuilders]]           # always accepted in addition to the registry set
 Address = "0x..."
@@ -84,9 +83,8 @@ URL = "http://my-builder"
 
 Behavior:
 
-- No separate RPC URL is required. Each poll tries `Validators.PrivateURL` in configuration order,
-  starting with the first validator. If `Registry.RPCURL` is set, it is tried first, followed by the
-  validators. Duplicate URLs are tried only once. All sources must be trusted nodes on the same chain.
+- Each poll tries the distinct `Validators.PrivateURL` endpoints in configuration order.
+  All sources must be trusted nodes on the same chain.
   A dial, read, or decode failure advances to the next source; the first successful snapshot wins.
   Each source gets up to 10 seconds for the complete attempt, so a poll can take up to 10 seconds
   per distinct source when nodes time out. Shutdown cancels the current attempt and stops retries.

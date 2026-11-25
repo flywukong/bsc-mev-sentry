@@ -26,6 +26,20 @@ type Config struct {
 	Log   LogConfig
 }
 
+// RegistrySources returns distinct validator RPC endpoints in configuration order.
+func (c *Config) RegistrySources() []string {
+	var urls []string
+	seen := make(map[string]bool)
+	for _, validator := range c.Validators {
+		url := validator.PrivateURL
+		if url != "" && !seen[url] {
+			urls = append(urls, url)
+			seen[url] = true
+		}
+	}
+	return urls
+}
+
 func Load(file string) *Config {
 	f, err := os.Open(file)
 	if err != nil {
@@ -43,8 +57,8 @@ func Load(file string) *Config {
 	if err := cfg.Registry.Validate(); err != nil {
 		panic(err)
 	}
-	if cfg.Registry.Enabled && len(cfg.Registry.RPCURLs(cfg.Validators)) == 0 {
-		panic("registry: configure at least one Validators.PrivateURL or Registry.RPCURL")
+	if cfg.Registry.Enabled && len(cfg.RegistrySources()) == 0 {
+		panic("registry: configure at least one Validators.PrivateURL")
 	}
 	return &cfg
 }

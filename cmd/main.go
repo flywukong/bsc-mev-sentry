@@ -78,7 +78,7 @@ func main() {
 		registryWG.Wait()
 	}()
 	if cfg.Registry.Enabled {
-		rpcURLs := cfg.Registry.RPCURLs(cfg.Validators)
+		rpcURLs := cfg.RegistrySources()
 		reader := registry.NewFallbackReader(rpcURLs, cfg.Registry.ContractAddress)
 		log.Infow("registry sync enabled",
 			"contract", cfg.Registry.ContractAddress,
