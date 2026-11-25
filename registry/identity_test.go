@@ -43,9 +43,9 @@ func TestSyncer_RegistryProbeFailurePreservesPolicy(t *testing.T) {
 	}
 	s, set, state := newSyncer(NewClient(backend, a3), Config{}, nil)
 
-	// An implementation address must neither open service ports nor enable allow-all.
+	// An implementation address must not open service ports.
 	require.Equal(t, ResultError, s.SyncOnce(context.Background()))
-	require.False(t, set.AllowAll())
+	require.False(t, set.Allowed(a2))
 	require.Equal(t, "not_a_registry", state.Snapshot().LastError)
 	select {
 	case <-s.Ready():
@@ -56,29 +56,29 @@ func TestSyncer_RegistryProbeFailurePreservesPolicy(t *testing.T) {
 	// A valid, initialized proxy is allowed to have an empty list.
 	backend.capOutput = common.LeftPadBytes([]byte{4}, 32)
 	require.Equal(t, ResultEmpty, s.SyncOnce(context.Background()))
-	require.True(t, set.AllowAll())
+	require.Zero(t, set.Len())
 	select {
 	case <-s.Ready():
+		t.Fatal("empty registry signaled readiness")
 	default:
-		t.Fatal("initialized empty registry did not signal service readiness")
 	}
 
-	// A later probe failure preserves allow-all just like any other failed read.
+	// A later probe failure keeps the initial allowlist empty.
 	backend.capOutput = make([]byte, 32)
 	require.Equal(t, ResultError, s.SyncOnce(context.Background()))
-	require.True(t, set.AllowAll())
+	require.Zero(t, set.Len())
 
 	backend.capOutput = common.LeftPadBytes([]byte{4}, 32)
 	backend.output = packBuilders(t, []Builder{b(a1, "https://builder.example", "builder")})
 	require.Equal(t, ResultApplied, s.SyncOnce(context.Background()))
-	require.False(t, set.AllowAll())
+	require.False(t, set.Allowed(a2))
 	previous := state.Snapshot()
 
 	// A failed probe must not replace a working list with an empty snapshot.
 	backend.output = packBuilders(t, nil)
 	backend.capOutput = make([]byte, 32)
 	require.Equal(t, ResultError, s.SyncOnce(context.Background()))
-	require.False(t, set.AllowAll())
+	require.False(t, set.Allowed(a2))
 	require.True(t, set.Allowed(a1))
 	require.False(t, set.Allowed(a2))
 	require.Equal(t, previous.Fingerprint, state.Snapshot().Fingerprint)
@@ -94,7 +94,7 @@ func TestSyncer_RegistryProbeErrorsAreSanitized(t *testing.T) {
 	s, set, state := newSyncer(NewClient(backend, a3), Config{}, nil)
 	require.Equal(t, ResultError, s.SyncOnce(context.Background()))
 	require.Equal(t, "timeout", state.Snapshot().LastError)
-	require.False(t, set.AllowAll())
+	require.False(t, set.Allowed(a2))
 }
 
 func TestFallbackReader_UninitializedRegistryTriesNextSource(t *testing.T) {

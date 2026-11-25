@@ -32,8 +32,7 @@ URL = "http://bsc-builder-2"
 
 # Optional: keep the allowlist in sync with the on-chain BuilderKeyRegistry.
 # Effective allowlist = registry set ∪ ExtraBuilders. Service ports open after the first
-# successful read. A failed read never changes the allowlist. An empty registry switches to
-# allow-all mode (any builder address accepted, logged at error level) until it is refilled.
+# non-empty on-chain read. Empty or failed reads preserve the previous allowlist.
 [Registry]
 Enabled = false
 ContractAddress = "0x0000000000000000000000000000000000000000" # BuilderKeyRegistry proxy on this network.

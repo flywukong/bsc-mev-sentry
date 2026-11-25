@@ -75,13 +75,7 @@ func NewMevSentryWithSet(cfg *Config,
 // RegistryStatus reports where the current allowlist came from and at which block.
 // Exposed as mev_registryStatus so operators can verify sentries have converged.
 func (s *MevSentry) RegistryStatus() RegistryStatus {
-	st := s.registry.Snapshot()
-	st.BuilderCount = s.builders.Len()
-	st.Mode = ModeAllowlist
-	if s.builders.AllowAll() {
-		st.Mode = ModeAllowAll
-	}
-	return st
+	return s.registry.Snapshot()
 }
 
 // BidArgsWrapper Override the BidArgs type to add validator host name

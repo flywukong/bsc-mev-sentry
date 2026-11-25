@@ -55,17 +55,10 @@ var (
 		Help:      "Number of builder keys in the effective allowlist after local overrides.",
 	})
 
-	RegistryAllowAll = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: namespace,
-		Subsystem: "registry",
-		Name:      "allow_all",
-		Help:      "1 while the registry is empty and builder addresses are not checked, otherwise 0.",
-	})
-
 	RegistryLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Subsystem: "registry",
 		Name:      "last_success_timestamp_seconds",
-		Help:      "Unix time of the last successful registry read.",
+		Help:      "Unix time of the last non-empty registry read.",
 	})
 )

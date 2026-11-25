@@ -94,12 +94,12 @@ func main() {
 		}()
 
 		// Service ports stay closed until the allowlist comes from the registry.
-		log.Infow("waiting for the first registry read before opening service ports")
+		log.Infow("waiting for the first non-empty registry read before opening service ports")
 		select {
 		case <-syncer.Ready():
-			log.Infow("first registry read succeeded; opening service ports")
+			log.Infow("first non-empty registry read succeeded; opening service ports")
 		case sig := <-sigCh:
-			log.Infow("received signal before the first registry read, shutting down", "signal", sig.String())
+			log.Infow("received signal before the first non-empty registry read, shutting down", "signal", sig.String())
 			return
 		}
 	}

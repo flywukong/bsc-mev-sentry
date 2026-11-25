@@ -14,9 +14,8 @@ import (
 
 const (
 	DefaultPollInterval = 10 * time.Minute
-	// AllowAllPollInterval applies while the registry is empty, so a refilled
-	// registry ends allow-all mode quickly.
-	AllowAllPollInterval = 3 * time.Second
+	// EmptyPollInterval bounds the wait until a refilled registry is observed.
+	EmptyPollInterval = 3 * time.Second
 	// Failed reads, including the first one at startup, retry with exponential
 	// backoff between these bounds.
 	MinRetryInterval = 2 * time.Second
@@ -27,8 +26,7 @@ const (
 
 // Config is the [Registry] section of the sentry config file.
 //
-// Effective allowlist: registry set ∪ ExtraBuilders. An empty registry switches
-// the sentry to allow-all mode. The static [[Builders]] list is not used.
+// Effective allowlist: last non-empty registry set ∪ ExtraBuilders. The static [[Builders]] list is not used.
 type Config struct {
 	// Enabled turns on periodic synchronization. When false the static
 	// [[Builders]] list is used exactly as before.

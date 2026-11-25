@@ -21,15 +21,12 @@ type Result string
 const (
 	ResultApplied   Result = "applied"   // registry changed; allowlist replaced
 	ResultUnchanged Result = "unchanged" // same non-empty fingerprint as last time
-	ResultEmpty     Result = "empty"     // registry decoded to zero builders; allow-all mode
-	ResultError     Result = "error"     // read failed; previous allowlist and mode kept
+	ResultEmpty     Result = "empty"     // empty snapshot ignored
+	ResultError     Result = "error"     // read failed; previous allowlist kept
 )
 
 // Syncer periodically reads the registry and pushes the merged allowlist to the
-// sentry. A failed read never changes the allowlist or the mode. A non-empty
-// registry selects allowlist mode; an empty one selects allow-all mode, which
-// keeps the last non-empty allowlist for builder URLs. Missing code and a failed
-// initialized-registry check are treated as read failures.
+// sentry. Only non-empty snapshots are applied.
 type Syncer struct {
 	reader   Reader
 	interval time.Duration
@@ -39,9 +36,8 @@ type Syncer struct {
 	builders *service.BuilderSet
 	status   *service.RegistryState
 
-	last   *Snapshot
-	listed []Builder // last non-empty registry set
-	retry  time.Duration
+	last  *Snapshot
+	retry time.Duration
 
 	ready     chan struct{}
 	readyOnce sync.Once
@@ -62,7 +58,7 @@ func NewSyncer(cfg *Config, reader Reader, builders *service.BuilderSet, status 
 	return s
 }
 
-// Ready is closed after the first successful read, empty or not.
+// Ready is closed after the first non-empty registry snapshot is installed.
 func (s *Syncer) Ready() <-chan struct{} { return s.ready }
 
 // Run syncs immediately, then schedules each next read by the last result
@@ -80,7 +76,7 @@ func (s *Syncer) Run(ctx context.Context) {
 	}
 }
 
-// nextDelay backs off after failures, polls quickly in allow-all mode, and
+// nextDelay backs off after failures, polls quickly after an empty read, and
 // otherwise waits the configured interval.
 func (s *Syncer) nextDelay(r Result) time.Duration {
 	if r == ResultError {
@@ -89,8 +85,8 @@ func (s *Syncer) nextDelay(r Result) time.Duration {
 		return d
 	}
 	s.retry = s.minRetry()
-	if s.builders.AllowAll() {
-		return min(AllowAllPollInterval, s.interval)
+	if r == ResultEmpty {
+		return min(EmptyPollInterval, s.interval)
 	}
 	return s.interval
 }
@@ -108,14 +104,14 @@ func (s *Syncer) SyncOnce(ctx context.Context) Result {
 		return s.record(ResultError)
 	}
 
-	var result Result
-	switch {
-	case len(snap.Builders) == 0:
-		s.applyEmpty(snap)
-		result = ResultEmpty
-	case s.last != nil && s.last.Fingerprint == snap.Fingerprint:
-		result = ResultUnchanged
-	default:
+	if len(snap.Builders) == 0 {
+		log.Warnw("empty builder registry; waiting for a non-empty snapshot", "block", snap.BlockNumber, "contract", s.contract)
+		s.status.RecordError("empty_registry")
+		return s.record(ResultEmpty)
+	}
+
+	result := ResultUnchanged
+	if s.last == nil || s.last.Fingerprint != snap.Fingerprint {
 		s.applyList(snap)
 		result = ResultApplied
 	}
@@ -128,34 +124,14 @@ func (s *Syncer) SyncOnce(ctx context.Context) Result {
 	return s.record(result)
 }
 
-// applyEmpty enters or stays in allow-all mode. Logged at error level on every
-// read, since either all MEV keys were removed on purpose or the registry was
-// emptied by mistake, and builder addresses are unchecked meanwhile.
-func (s *Syncer) applyEmpty(snap *Snapshot) {
-	entered := s.builders.SetAllowAll(true)
-	metrics.RegistryAllowAll.Set(1)
-	if entered && s.listed == nil {
-		// No non-empty set seen yet: ExtraBuilders still need URLs for mev_reportIssue.
-		s.builders.Replace(Merge(nil, s.extra))
-	}
-	msg := "registry is empty; allow-all mode continues, builder addresses are not checked"
-	if entered {
-		msg = "registry is empty; entering allow-all mode, builder addresses are not checked"
-	}
-	log.Errorw(msg, "block", snap.BlockNumber, "contract", s.contract)
-}
-
-// applyList installs a non-empty registry set and leaves allow-all mode.
 func (s *Syncer) applyList(snap *Snapshot) {
 	effective := Merge(snap.Builders, s.extra)
 	s.builders.Replace(effective)
-	if s.builders.SetAllowAll(false) {
-		log.Warnw("registry is non-empty; leaving allow-all mode",
-			"block", snap.BlockNumber, "contract", s.contract)
+	var previous []Builder
+	if s.last != nil {
+		previous = s.last.Builders
 	}
-	metrics.RegistryAllowAll.Set(0)
-
-	added, removed := Diff(s.listed, snap.Builders)
+	added, removed := Diff(previous, snap.Builders)
 	log.Infow("registry allowlist applied",
 		"block", snap.BlockNumber,
 		"fingerprint", snap.Fingerprint.TerminalString(),
@@ -163,12 +139,11 @@ func (s *Syncer) applyList(snap *Snapshot) {
 		"effective", len(effective),
 		"added", summarize(added),
 		"removed", summarize(removed))
-	s.listed = snap.Builders
 }
 
 func (s *Syncer) record(r Result) Result {
 	metrics.RegistrySyncTotal.WithLabelValues(string(r)).Inc()
-	if r != ResultError {
+	if r == ResultApplied || r == ResultUnchanged {
 		metrics.RegistryLastSuccess.SetToCurrentTime()
 	}
 	return r

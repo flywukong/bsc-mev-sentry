@@ -16,12 +16,8 @@ import (
 // It is deliberately a separate type from MevSentry: rpc.RegisterName exposes
 // every exported method of the registered receiver, so a mutating method on
 // MevSentry would become a public RPC.
-//
-// In allow-all mode every address may submit bids, while the map keeps the last
-// non-empty allowlist so mev_reportIssue can still resolve builder URLs.
 type BuilderSet struct {
-	m        atomic.Pointer[map[common.Address]node.Builder]
-	allowAll atomic.Bool
+	m atomic.Pointer[map[common.Address]node.Builder]
 }
 
 // NewBuilderSet wraps an initial map. Nil is treated as empty.
@@ -35,7 +31,6 @@ func NewBuilderSet(initial map[common.Address]node.Builder) *BuilderSet {
 }
 
 // Lookup returns the builder for addr and whether it is in the allowlist map.
-// It ignores allow-all mode; use Allowed for admission.
 func (s *BuilderSet) Lookup(addr common.Address) (node.Builder, bool) {
 	b, ok := (*s.m.Load())[addr]
 	return b, ok
@@ -43,19 +38,8 @@ func (s *BuilderSet) Lookup(addr common.Address) (node.Builder, bool) {
 
 // Allowed reports whether addr may submit bids.
 func (s *BuilderSet) Allowed(addr common.Address) bool {
-	if s.allowAll.Load() {
-		return true
-	}
 	_, ok := s.Lookup(addr)
 	return ok
-}
-
-// AllowAll reports whether builder addresses are currently unchecked.
-func (s *BuilderSet) AllowAll() bool { return s.allowAll.Load() }
-
-// SetAllowAll switches allow-all mode and reports whether the mode changed.
-func (s *BuilderSet) SetAllowAll(on bool) bool {
-	return s.allowAll.Swap(on) != on
 }
 
 // Len returns the number of allowlisted keys.
@@ -94,8 +78,7 @@ func (s *BuilderSet) Replace(configs []node.BuilderConfig) {
 // compare Fingerprint and BlockNumber across sentries to confirm convergence.
 type RegistryStatus struct {
 	Enabled      bool           `json:"enabled"`
-	Source       string         `json:"source"` // "static" until the first successful registry read, then "registry"
-	Mode         string         `json:"mode"`   // ModeAllowlist, or ModeAllowAll while the registry is empty
+	Source       string         `json:"source"` // "static" until the first non-empty registry read, then "registry"
 	Contract     common.Address `json:"contract,omitempty"`
 	BlockNumber  uint64         `json:"blockNumber,omitempty"`
 	BlockHash    common.Hash    `json:"blockHash,omitempty"`
@@ -107,11 +90,6 @@ type RegistryStatus struct {
 	LastError   string    `json:"lastError,omitempty"`
 	LastErrorAt time.Time `json:"lastErrorAt,omitempty"`
 }
-
-const (
-	ModeAllowlist = "allowlist"
-	ModeAllowAll  = "allow_all"
-)
 
 // RegistryState holds the mutable status behind RegistryStatus. Like BuilderSet
 // it lives outside MevSentry so its setters are not exposed over RPC.
